@@ -1,0 +1,6 @@
+{
+  "summary":  "Updated implementation plan for SageKonaBess to enforce that ChipDefinition and voltage levels are never assumed globally, and instead are strictly derived from the default reading of the device's existing DTB/DTS values and KonaBess's chip detection.",
+  "updatedAt":  "2026-10-23T03:02:15.865203627Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

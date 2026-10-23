@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">SageKonaBess</string>
+    <string name="subtitle_hardware_tuner">Qualcomm Adreno GPU Frequency &amp; Voltage Table Editor</string>
+    <string name="tab_freq_table">GPU Freq Table</string>
+    <string name="tab_volt_table">GPU Volt Table</string>
+    <string name="tab_import_export">Import / Export</string>
+    <string name="tab_dts_console">DTS &amp; Shell Log</string>
+    <string name="action_unpack_device">Unpack Device Image</string>
+    <string name="action_backup_image">Backup Old Image</string>
+    <string name="action_repack_flash">Repack &amp; Flash</string>
+    <string name="action_drop_volt_step">Drop Voltage (-1 Step)</string>
+    <string name="action_raise_volt_step">Step Up (+1)</string>
+    <string name="action_reset_stock">Reset to Stock</string>
+    <string name="action_new_freq">New Frequency Step</string>
+    <string name="label_bottom_two_locked">Bottom 2 Frequencies Protected (Unchanged)</string>
+    <string name="label_locked_badge">LOCKED (BOTTOM 2)</string>
+    <string name="label_stock_badge">STOCK</string>
+    <string name="label_modified_badge">MODIFIED</string>
+    <string name="dialog_edit_freq_title">Edit Frequency Step</string>
+    <string name="dialog_save">Apply Changes</string>
+    <string name="dialog_cancel">Cancel</string>
+    <string name="dialog_delete_step">Delete Step</string>
+    <string name="dialog_clone_step">Duplicate Step</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "SageKonaBess",
+  "description": "Modernized Qualcomm Snapdragon Adreno GPU frequency and voltage table editor with one-tap cascade voltage step dropping.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
