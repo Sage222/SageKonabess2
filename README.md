@@ -4,13 +4,13 @@
 
 ---
 
-## Pre-Compiled APK
+## Pre-Compiled APK Download
 
-A pre-compiled APK is included directly in this repository for immediate installation:
+Because Google AI Studio's GitHub sync only pushes text/source files (and skips raw `.apk` binaries), this repository includes an automated GitHub Actions workflow ([`.github/workflows/publish-apk.yml`](.github/workflows/publish-apk.yml)) that automatically compiles the APK on push, commits it to `releases/SageKonaBess-v1.0.apk`, and publishes it to **GitHub Releases**:
 
-- **Download / Install Path:** [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk)
-
-*(You can also generate a fresh APK or AAB anytime via `./gradlew assembleDebug` / `gradle assembleDebug` or the AI Studio Export / Build menu).*
+1. **Direct GitHub Release Download:** [**Download `SageKonaBess-v1.0.apk` from Releases**](../../releases/latest/download/SageKonaBess-v1.0.apk)
+2. **Repository File Path (committed by GitHub Actions after push):** [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk)
+3. **Inside Google AI Studio:** You can also download the pre-compiled APK directly from AI Studio via the top-right **Settings / Export menu → Generate / Download APK**.
 
 ---
 

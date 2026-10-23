@@ -1,0 +1,76 @@
+name: Build & Publish Pre-Compiled APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "releases/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Decode debug.keystore from base64
+        run: |
+          if [ -f "debug.keystore.base64" ] && [ ! -f "debug.keystore" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+          if [ ! -f ".env" ] && [ -f ".env.example" ]; then
+            cp .env.example .env
+          fi
+
+      - name: Setup Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Commit Pre-Compiled APK to releases/
+        run: |
+          mkdir -p releases
+          cp app/build/outputs/apk/debug/app-debug.apk releases/SageKonaBess-v1.0.apk
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f releases/SageKonaBess-v1.0.apk
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(release): update pre-compiled SageKonaBess-v1.0.apk [skip ci]"
+            git push
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SageKonaBess-v1.0-apk
+          path: releases/SageKonaBess-v1.0.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "SageKonaBess v1.0.0"
+          body: "Automated pre-compiled APK build of SageKonaBess with modernized UI and One-Tap Voltage Step Drop (-1 Step)."
+          files: releases/SageKonaBess-v1.0.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
