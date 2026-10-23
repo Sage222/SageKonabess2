@@ -50,12 +50,10 @@ import com.example.konabess.model.GpuFreqRow
 import com.example.konabess.model.GpuOppVoltRow
 import com.example.konabess.model.KnownRpmhLabels
 import com.example.ui.theme.BorderHairline
-import com.example.ui.theme.NominalAmber
 import com.example.ui.theme.SlateElevated
 import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TelemetryCyan
 import com.example.ui.theme.TelemetryCyanDim
-import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.TurboCoral
@@ -76,10 +74,17 @@ fun EditFreqRowDialog(
     var freqMhzText by remember(row.id) { mutableStateOf(row.frequencyMHz.toString()) }
     var selectedVoltageCode by remember(row.id) { mutableIntStateOf(row.voltageLevelCode) }
     var customVoltageCodeText by remember(row.id) { mutableStateOf("") }
+    var showAllChipLevels by remember(row.id) { mutableStateOf(false) }
     var busFreqText by remember(row.id) { mutableStateOf(row.busFreq.toString()) }
     var busMinText by remember(row.id) { mutableStateOf(row.busMin.toString()) }
     var busMaxText by remember(row.id) { mutableStateOf(row.busMax.toString()) }
     var acdHexText by remember(row.id) { mutableStateOf(row.acdLevelHex.orEmpty()) }
+
+    val displayedLevels = if (showAllChipLevels) {
+        chipProfile.chipFamilyManualLevels
+    } else {
+        chipProfile.readVoltageLevels
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -103,17 +108,37 @@ fun EditFreqRowDialog(
                     fontWeight = FontWeight.Bold
                 )
 
-                Text(
-                    text = "Select from existing voltage levels read from device (${chipProfile.levelPropertyKey}):",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextSecondary
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (showAllChipLevels) {
+                            "All Chip RPMh Levels (${chipProfile.levelPropertyKey}):"
+                        } else {
+                            "Stock Levels Read from DTB (${chipProfile.levelPropertyKey}):"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = { showAllChipLevels = !showAllChipLevels }
+                    ) {
+                        Text(
+                            text = if (showAllChipLevels) "Stock Only" else "+ Manual Levels",
+                            color = TelemetryCyan,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
 
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    chipProfile.readVoltageLevels.forEach { level ->
+                    displayedLevels.forEach { level ->
                         val isSelected = selectedVoltageCode == level.code && customVoltageCodeText.isBlank()
                         FilterChip(
                             selected = isSelected,
@@ -123,7 +148,7 @@ fun EditFreqRowDialog(
                             },
                             label = {
                                 Text(
-                                    text = "${level.label} (0x${level.code.toString(16)})",
+                                    text = "${level.label} (${level.code})",
                                     style = MaterialTheme.typography.labelMedium
                                 )
                             },
@@ -198,7 +223,6 @@ fun EditFreqRowDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                // Secondary row actions: Set Initial Boot Level, Duplicate, Delete
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -258,7 +282,6 @@ fun EditFreqRowDialog(
                     }
                 }
 
-                // Dialog Confirm / Cancel
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.End,
@@ -275,7 +298,7 @@ fun EditFreqRowDialog(
                         onClick = {
                             val parsedMhz = freqMhzText.toLongOrNull() ?: row.frequencyMHz
                             val resolvedVoltCode = if (customVoltageCodeText.isNotBlank()) {
-                                KnownRpmhLabels.encodeLabelToCodeIfKnown(customVoltageCodeText)
+                                KnownRpmhLabels.encodeLabelToCodeIfKnown(customVoltageCodeText, chipProfile.chipType)
                                     ?: selectedVoltageCode
                             } else {
                                 selectedVoltageCode
@@ -321,13 +344,20 @@ fun NewFreqRowDialog(
         acdHex: String?
     ) -> Unit
 ) {
-    val defaultCode = chipProfile.readVoltageLevels.lastOrNull()?.code ?: 224
-    var freqMhzText by remember { mutableStateOf("855") }
+    val defaultCode = chipProfile.readVoltageLevels.lastOrNull()?.code ?: 192
+    var freqMhzText by remember { mutableStateOf("750") }
     var selectedVoltageCode by remember { mutableIntStateOf(defaultCode) }
-    var busFreqText by remember { mutableStateOf("11") }
-    var busMinText by remember { mutableStateOf("9") }
-    var busMaxText by remember { mutableStateOf("11") }
+    var showAllChipLevels by remember { mutableStateOf(false) }
+    var busFreqText by remember { mutableStateOf("8") }
+    var busMinText by remember { mutableStateOf("6") }
+    var busMaxText by remember { mutableStateOf("10") }
     var acdHexText by remember { mutableStateOf("") }
+
+    val displayedLevels = if (showAllChipLevels) {
+        chipProfile.chipFamilyManualLevels
+    } else {
+        chipProfile.readVoltageLevels
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -362,23 +392,36 @@ fun NewFreqRowDialog(
                         .testTag("new_step_freq_input")
                 )
 
-                Text(
-                    text = "Voltage Level (from existing read table):",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextSecondary
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = if (showAllChipLevels) "All Chip RPMh Levels:" else "Stock Voltage Levels:",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary
+                    )
+                    TextButton(onClick = { showAllChipLevels = !showAllChipLevels }) {
+                        Text(
+                            text = if (showAllChipLevels) "Stock Only" else "+ Manual Levels",
+                            color = TelemetryCyan,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
 
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    chipProfile.readVoltageLevels.forEach { level ->
+                    displayedLevels.forEach { level ->
                         FilterChip(
                             selected = selectedVoltageCode == level.code,
                             onClick = { selectedVoltageCode = level.code },
                             label = {
                                 Text(
-                                    text = level.label,
+                                    text = "${level.label} (${level.code})",
                                     style = MaterialTheme.typography.labelMedium
                                 )
                             },
@@ -440,13 +483,13 @@ fun NewFreqRowDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val mhz = freqMhzText.toLongOrNull() ?: 800L
+                            val mhz = freqMhzText.toLongOrNull() ?: 750L
                             onAddStep(
                                 mhz,
                                 selectedVoltageCode,
-                                busFreqText.toIntOrNull() ?: 11,
-                                busMinText.toIntOrNull() ?: 9,
-                                busMaxText.toIntOrNull() ?: 11,
+                                busFreqText.toIntOrNull() ?: 8,
+                                busMinText.toIntOrNull() ?: 6,
+                                busMaxText.toIntOrNull() ?: 10,
                                 acdHexText.takeIf { it.isNotBlank() }
                             )
                         },

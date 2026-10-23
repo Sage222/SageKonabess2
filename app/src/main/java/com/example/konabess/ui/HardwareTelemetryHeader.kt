@@ -3,7 +3,6 @@ package com.example.konabess.ui
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,6 +26,7 @@ import androidx.compose.material.icons.filled.DeveloperBoard
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
@@ -51,8 +51,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.konabess.model.DetectedDtb
 import com.example.konabess.model.DynamicChipProfile
 import com.example.konabess.model.GpuPowerBin
+import com.example.konabess.model.KnownRpmhLabels
 import com.example.ui.theme.BorderHairline
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.NominalAmber
@@ -74,13 +76,17 @@ fun HardwareTelemetryHeader(
     chipProfile: DynamicChipProfile,
     bins: List<GpuPowerBin>,
     selectedBinIndex: Int,
+    detectedDtbs: List<DetectedDtb>,
+    selectedDtbId: Int,
     hasRootAccess: Boolean,
     activePartition: String,
     statusMessage: String?,
     isStatusSuccess: Boolean,
     onDismissStatus: () -> Unit,
+    onSelectDtb: (Int) -> Unit,
     onSelectBin: (Int) -> Unit,
     onUnpackDevice: () -> Unit,
+    onSaveTable: () -> Unit,
     onBackupImage: () -> Unit,
     onRepackAndFlash: () -> Unit,
     modifier: Modifier = Modifier
@@ -124,7 +130,6 @@ fun HardwareTelemetryHeader(
                             )
                             y += gridStep
                         }
-                        // Stepped voltage cascade decorative trace on right side
                         val path = Path().apply {
                             moveTo(size.width * 0.62f, size.height * 0.18f)
                             lineTo(size.width * 0.72f, size.height * 0.18f)
@@ -193,7 +198,7 @@ fun HardwareTelemetryHeader(
                                         )
                                     ) {
                                         Text(
-                                            text = if (hasRootAccess) "ROOT SHELL" else "DTS WORKSPACE",
+                                            text = if (hasRootAccess) "ROOT SHELL" else "UNROOTED / IMPORT",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = if (hasRootAccess) UndervoltEmerald else TelemetryCyan,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -212,58 +217,60 @@ fun HardwareTelemetryHeader(
                     }
 
                     // Dynamic ChipDefinition telemetry pills (showing exact existing read voltage levels)
-                    Surface(
-                        color = ObsidianBackground.copy(alpha = 0.75f),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, BorderHairline),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                    if (chipProfile.readVoltageLevels.isNotEmpty()) {
+                        Surface(
+                            color = ObsidianBackground.copy(alpha = 0.75f),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, BorderHairline),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "READ FROM EXISTING VALUES (${chipProfile.levelPropertyKey})",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TelemetryCyan
-                                )
-                                Text(
-                                    text = "Partition: $activePartition",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextMuted
-                                )
-                            }
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            Column(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                chipProfile.readVoltageLevels.forEach { readLevel ->
-                                    Surface(
-                                        color = SlateElevated,
-                                        shape = RoundedCornerShape(4.dp),
-                                        border = BorderStroke(1.dp, BorderHairline)
-                                    ) {
-                                        Text(
-                                            text = readLevel.label,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = TextSecondary,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "STOCK LEVELS READ (${chipProfile.levelPropertyKey})",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TelemetryCyan
+                                    )
+                                    Text(
+                                        text = activePartition,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    chipProfile.readVoltageLevels.forEach { readLevel ->
+                                        Surface(
+                                            color = SlateElevated,
+                                            shape = RoundedCornerShape(4.dp),
+                                            border = BorderStroke(1.dp, BorderHairline)
+                                        ) {
+                                            Text(
+                                                text = readLevel.label,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextSecondary,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Core KonaBess Image Operations Bar (Unpack / Backup / Repack & Flash)
+                    // Core KonaBess Image Operations Bar (Re-Read / Backup / Save / Repack & Flash)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         OutlinedButton(
                             onClick = onUnpackDevice,
@@ -274,7 +281,7 @@ fun HardwareTelemetryHeader(
                                 contentColor = TextPrimary
                             ),
                             modifier = Modifier
-                                .weight(1f)
+                                .weight(0.95f)
                                 .height(48.dp)
                                 .testTag("unpack_device_button")
                         ) {
@@ -282,12 +289,12 @@ fun HardwareTelemetryHeader(
                                 imageVector = Icons.Default.Refresh,
                                 contentDescription = "Unpack Image",
                                 tint = TelemetryCyan,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(15.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = "Re-Read",
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall,
                                 maxLines = 1
                             )
                         }
@@ -301,7 +308,7 @@ fun HardwareTelemetryHeader(
                                 contentColor = TextPrimary
                             ),
                             modifier = Modifier
-                                .weight(1f)
+                                .weight(0.95f)
                                 .height(48.dp)
                                 .testTag("backup_image_button")
                         ) {
@@ -309,12 +316,39 @@ fun HardwareTelemetryHeader(
                                 imageVector = Icons.Default.Backup,
                                 contentDescription = "Backup Old Image",
                                 tint = NominalAmber,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(15.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
                                 text = "Backup",
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = onSaveTable,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, BorderHairline),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = SlateElevated,
+                                contentColor = UndervoltEmerald
+                            ),
+                            modifier = Modifier
+                                .weight(0.95f)
+                                .height(48.dp)
+                                .testTag("save_table_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Save,
+                                contentDescription = "Save GPU Freq Table",
+                                tint = UndervoltEmerald,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Save",
+                                style = MaterialTheme.typography.labelSmall,
                                 maxLines = 1
                             )
                         }
@@ -334,12 +368,12 @@ fun HardwareTelemetryHeader(
                             Icon(
                                 imageVector = Icons.Default.FlashOn,
                                 contentDescription = "Repack and Flash",
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(15.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = "Repack & Flash",
-                                style = MaterialTheme.typography.labelMedium,
+                                text = "Flash",
+                                style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1
                             )
@@ -349,7 +383,46 @@ fun HardwareTelemetryHeader(
             }
         }
 
-        // GPU Speed Bin Selector Row (if multiple bins exist or showing Bin 0)
+        // Multiple DTB Selector Row (when device boot/vendor_boot has multiple compatible DTBs)
+        if (detectedDtbs.size > 1) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "DTB:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = TextMuted
+                )
+                detectedDtbs.forEach { dtb ->
+                    val isSelected = dtb.id == selectedDtbId
+                    val activeTag = if (dtb.isActiveBootDtb) " [ACTIVE]" else ""
+                    FilterChip(
+                        selected = isSelected,
+                        onClick = { onSelectDtb(dtb.id) },
+                        label = {
+                            Text(
+                                text = "DTB #${dtb.id}: ${dtb.description}$activeTag",
+                                fontFamily = JetBrainsMonoFontFamily,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = UndervoltEmeraldDim,
+                            selectedLabelColor = UndervoltEmerald,
+                            containerColor = SlateSurface,
+                            labelColor = TextSecondary
+                        ),
+                        modifier = Modifier.testTag("dtb_chip_${dtb.id}")
+                    )
+                }
+            }
+        }
+
+        // GPU Speed Bin Selector Row (using exact KonaBessStr.convert_bins labels)
         if (bins.isNotEmpty()) {
             Row(
                 modifier = Modifier
@@ -372,13 +445,14 @@ fun HardwareTelemetryHeader(
                 bins.forEach { bin ->
                     val isSelected = bin.binIndex == selectedBinIndex
                     val modifiedCount = bin.modifiedRowCount
+                    val binTitle = KnownRpmhLabels.formatBinDisplayName(bin.binIndex, chipProfile.chipType)
                     FilterChip(
                         selected = isSelected,
                         onClick = { onSelectBin(bin.binIndex) },
                         label = {
                             val badge = if (modifiedCount > 0) " • $modifiedCount mod" else ""
                             Text(
-                                text = "Bin ${bin.binIndex} (${bin.levels.size} steps$badge)",
+                                text = "$binTitle (${bin.levels.size} steps$badge)",
                                 fontFamily = JetBrainsMonoFontFamily,
                                 style = MaterialTheme.typography.labelMedium
                             )

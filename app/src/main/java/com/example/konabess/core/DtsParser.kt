@@ -1,41 +1,153 @@
 package com.example.konabess.core
 
+import android.util.Base64
 import com.example.konabess.model.DynamicChipProfile
 import com.example.konabess.model.GpuFreqRow
 import com.example.konabess.model.GpuOppVoltRow
 import com.example.konabess.model.GpuPowerBin
 import com.example.konabess.model.KnownRpmhLabels
+import com.example.konabess.model.KonaBessChipType
 import com.example.konabess.model.ParsedDtsWorkspace
 import com.example.konabess.model.ReadVoltageLevel
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 
 /**
- * Parses and serializes Qualcomm Adreno GPU Device Tree Source (DTS) files and KonaBess
- * configuration exports.
+ * Authentic implementation of libxzr/KonaBess DtsHelper, ChipInfo, GpuTableEditor,
+ * GpuVoltEditor, and TableIO.
  *
- * CRITICAL PRINCIPLE: Never assumes a fixed ChipDefinition or global voltage level list.
- * All available voltage levels and properties are constructed strictly from the default reading
- * of the existing values in the unpacked/imported DTS.
+ * CRITICAL GUARANTEE:
+ * - Never invents or assumes frequencies or voltage levels not present in the device's DTB.
+ * - Preserves all surrounding DTS lines in `originalDtsLinesConsideringSplice` and splices
+ *   modified `qcom,gpu-pwrlevels` and `gpu-opp-table` blocks back in-place at `binSplicePosition`
+ *   and `voltSplicePosition` (matching `GpuTableEditor.genBack(genTable())`).
+ * - Handles the `dtc` decompiler quirk `decode_stringed_int` where 32-bit cells ending in `0x00`
+ *   with 3 printable ASCII bytes are emitted by `dtc` as `"..."` strings.
+ * - Preserves the trailing `qcom,gpu-freq = <0>` idle level at the end of each bin while hiding
+ *   it from the visible frequency list, matching `GpuTableEditor.generateLevels()`.
  */
 object DtsParser {
 
-    fun parseDts(dtsContent: String, sourcePartition: String = "boot / vendor_boot"): ParsedDtsWorkspace {
-        val lines = dtsContent.lines()
+    /**
+     * Detects the chip type from a decompiled `.dts` file using the exact matching rules from
+     * `libxzr/KonaBess` `KonaBessCore.checkDevice()`.
+     */
+    fun detectChipType(lines: List<String>): Pair<KonaBessChipType, String> {
+        var modelDesc = ""
+        var compatibleLine = ""
+        var hasSingleBinNode = false
+        var hasMultiBinNode = false
 
-        var modelName = ""
+        for (raw in lines) {
+            val line = raw.trim()
+            if (line.startsWith("model =") && modelDesc.isEmpty()) {
+                modelDesc = line.substringAfter("=").removeSuffix(";").trim().removeSurrounding("\"")
+            } else if (line.startsWith("compatible =") && compatibleLine.isEmpty()) {
+                compatibleLine = line.substringAfter("=").removeSuffix(";").trim()
+            } else if (line.startsWith("qcom,gpu-pwrlevels {")) {
+                hasSingleBinNode = true
+            } else if (line.startsWith("qcom,gpu-pwrlevels-")) {
+                hasMultiBinNode = true
+            }
+        }
+
+        val combined = "$modelDesc $compatibleLine"
+        val detectedType = when {
+            combined.contains("Canoe", ignoreCase = true) || compatibleLine.contains("qcom,canoe") ->
+                KonaBessChipType.canoe
+            combined.contains("Sun", ignoreCase = true) || compatibleLine.contains("qcom,sun") ->
+                KonaBessChipType.sun
+            compatibleLine.contains("qcom,cliffs") && modelDesc.contains("7") ->
+                KonaBessChipType.cliffs_7_singleBin
+            compatibleLine.contains("qcom,cliffs") ->
+                KonaBessChipType.cliffs_singleBin
+            compatibleLine.contains("qcom,pineapple") ->
+                KonaBessChipType.pineapple
+            compatibleLine.contains("qcom,ukee") ->
+                KonaBessChipType.ukee_singleBin
+            compatibleLine.contains("qcom,diwali") ->
+                KonaBessChipType.diwali
+            compatibleLine.contains("qcom,kalama") && (modelDesc.contains("SG") || hasSingleBinNode) ->
+                KonaBessChipType.kalama_sg_singleBin
+            compatibleLine.contains("qcom,kalama") ->
+                KonaBessChipType.kalama
+            compatibleLine.contains("qcom,cape") ->
+                KonaBessChipType.cape_singleBin
+            compatibleLine.contains("qcom,waipio") ->
+                KonaBessChipType.waipio_singleBin
+            compatibleLine.contains("qcom,yupik") ->
+                KonaBessChipType.yupik
+            compatibleLine.contains("qcom,shima") ->
+                KonaBessChipType.shima
+            compatibleLine.contains("qcom,lagoon") ->
+                KonaBessChipType.lagoon
+            compatibleLine.contains("qcom,lito") && modelDesc.contains("v2", ignoreCase = true) ->
+                KonaBessChipType.lito_v2
+            compatibleLine.contains("qcom,lito") ->
+                KonaBessChipType.lito_v1
+            compatibleLine.contains("qcom,lahaina") ->
+                if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.lahaina_singleBin else KonaBessChipType.lahaina
+            compatibleLine.contains("qcom,kona") || compatibleLine.contains("qcom,sm8250") ->
+                if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.kona_singleBin else KonaBessChipType.kona
+            compatibleLine.contains("qcom,msmnile") || compatibleLine.contains("qcom,sm8150") ->
+                if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.msmnile_singleBin else KonaBessChipType.msmnile
+            hasSingleBinNode && !hasMultiBinNode ->
+                KonaBessChipType.kona_singleBin
+            hasMultiBinNode ->
+                KonaBessChipType.kona
+            else ->
+                KonaBessChipType.unknown
+        }
+
+        return Pair(detectedType, modelDesc)
+    }
+
+    fun parseDts(
+        dtsContent: String,
+        sourcePartition: String = "vendor_boot / boot",
+        activeDtbId: Int = -1
+    ): ParsedDtsWorkspace {
+        if (dtsContent.isBlank()) {
+            val emptyProfile = DynamicChipProfile(
+                modelName = "No Unpacked Device Tree Loaded",
+                chipType = KonaBessChipType.unknown,
+                compatibleTokens = emptyList(),
+                msmIdHex = null,
+                levelPropertyKey = "qcom,level",
+                readVoltageLevels = emptyList(),
+                hasSeparateVoltTable = false,
+                sourcePartition = sourcePartition,
+                activeDtbId = activeDtbId
+            )
+            return ParsedDtsWorkspace(
+                chipProfile = emptyProfile,
+                bins = emptyList(),
+                oppVoltRows = emptyList(),
+                rawHeaderBlock = "",
+                rawFooterBlock = ""
+            )
+        }
+
+        val allLines = dtsContent.lines()
+        val (chipType, detectedModelDesc) = detectChipType(allLines)
+
+        var modelName = detectedModelDesc
         val compatibleTokens = mutableListOf<String>()
         var msmIdHex: String? = null
         var detectedLevelKey = "qcom,level"
 
-        // Extract top-level hardware identity from existing DTS lines
-        for (rawLine in lines) {
+        for (rawLine in allLines) {
             val line = rawLine.trim()
             if (line.startsWith("model =") && modelName.isEmpty()) {
                 modelName = extractQuotedStrings(line).firstOrNull().orEmpty()
             } else if (line.startsWith("compatible =") && compatibleTokens.isEmpty()) {
                 compatibleTokens.addAll(extractQuotedStrings(line))
             } else if (line.startsWith("qcom,msm-id =") && msmIdHex == null) {
-                msmIdHex = extractRawAngleBracketContent(line)
+                msmIdHex = decodeHexLine(line)
             } else if (line.startsWith("qcom,cx-ipeak =")) {
                 detectedLevelKey = "qcom,cx-ipeak"
             } else if (line.startsWith("qcom,level =")) {
@@ -43,8 +155,16 @@ object DtsParser {
             }
         }
 
-        val bins = parsePowerBins(lines, detectedLevelKey)
-        val oppRows = parseOppVoltTable(lines)
+        // Decode bins and splice points using exact GpuTableEditor algorithm
+        val workingLines = ArrayList(allLines)
+        val (bins, binPosition) = decodeAndExtractPowerBins(workingLines, chipType)
+
+        // Decode optional gpu-opp-table (for chips that don't ignore volt table)
+        val (oppRows, voltPosition, oppHeaderLines) = if (!chipType.voltTableIgnore) {
+            decodeAndExtractOppVoltTable(workingLines)
+        } else {
+            Triple(emptyList(), -1, emptyList())
+        }
 
         // Collect ONLY the voltage levels that actually exist in the read DTS table
         val existingLevelCodes = linkedSetOf<Int>()
@@ -64,7 +184,7 @@ object DtsParser {
             .map { code ->
                 ReadVoltageLevel(
                     code = code,
-                    label = KnownRpmhLabels.decodeKnownCodeOrRaw(code),
+                    label = KnownRpmhLabels.decodeKnownCodeOrRaw(code, chipType),
                     isFromExistingTable = true
                 )
             }
@@ -72,17 +192,19 @@ object DtsParser {
         val resolvedModelName = when {
             modelName.isNotBlank() -> modelName
             compatibleTokens.isNotEmpty() -> compatibleTokens.joinToString(" / ")
-            else -> "Qualcomm Snapdragon Adreno GPU (Read from DTS)"
+            else -> "Qualcomm Snapdragon Adreno GPU"
         }
 
         val chipProfile = DynamicChipProfile(
             modelName = resolvedModelName,
+            chipType = chipType,
             compatibleTokens = compatibleTokens,
             msmIdHex = msmIdHex,
             levelPropertyKey = detectedLevelKey,
             readVoltageLevels = sortedReadLevels,
             hasSeparateVoltTable = oppRows.isNotEmpty(),
-            sourcePartition = sourcePartition
+            sourcePartition = sourcePartition,
+            activeDtbId = activeDtbId
         )
 
         return ParsedDtsWorkspace(
@@ -90,193 +212,427 @@ object DtsParser {
             bins = bins,
             oppVoltRows = oppRows,
             rawHeaderBlock = extractHeaderMetadataComment(resolvedModelName, msmIdHex),
-            rawFooterBlock = ""
+            rawFooterBlock = "",
+            originalDtsLinesConsideringSplice = workingLines,
+            binSplicePosition = binPosition,
+            voltSplicePosition = voltPosition,
+            oppTableHeaderLines = oppHeaderLines
         )
     }
 
-    private fun parsePowerBins(lines: List<String>, defaultLevelKey: String): List<GpuPowerBin> {
+    /**
+     * Exact port of `GpuTableEditor.decode()` from `libxzr/KonaBess`:
+     * Finds `qcom,gpu-pwrlevels {` or `qcom,gpu-pwrlevels-X {`, records `bin_position`,
+     * removes the original bin lines from `linesInDts`, and parses each bin's header + levels.
+     */
+    private fun decodeAndExtractPowerBins(
+        linesInDts: MutableList<String>,
+        chipType: KonaBessChipType
+    ): Pair<List<GpuPowerBin>, Int> {
         val bins = mutableListOf<GpuPowerBin>()
+        var binPosition = -1
         var i = 0
-        var binCounter = 0
+        var fallbackBinCounter = 0
 
-        while (i < lines.size) {
-            val trimmed = lines[i].trim()
-            if (isBinNodeStart(trimmed)) {
-                val nodeName = trimmed.substringBefore("{").trim()
-                val explicitBinIdx = nodeName.substringAfterLast("qcom,gpu-pwrlevels-", "")
-                    .toIntOrNull() ?: binCounter
-                var braceDepth = countChar(trimmed, '{') - countChar(trimmed, '}')
-                i++
+        while (i < linesInDts.size) {
+            val trimmed = linesInDts[i].trim()
+            if (isBinNodeStart(trimmed, chipType.isSingleBin)) {
+                if (binPosition < 0) {
+                    binPosition = i
+                }
+                val openLine = linesInDts.removeAt(i)
+                val nodeName = openLine.trim().substringBefore("{").trim()
+                val binId = if (nodeName.contains("qcom,gpu-pwrlevels-")) {
+                    nodeName.substringAfterLast("qcom,gpu-pwrlevels-").trim().toIntOrNull() ?: fallbackBinCounter
+                } else {
+                    fallbackBinCounter
+                }
 
+                var bracket = countChar(openLine, '{') - countChar(openLine, '}')
+                val rawHeaderLines = mutableListOf<String>()
+                val headerProps = linkedMapOf<String, String>()
                 var speedBinValue: Int? = null
                 var initialPwrLevel = 1
                 var throttlePwrLevel: Int? = null
-                val headerProps = linkedMapOf<String, String>()
-                val parsedRows = mutableListOf<GpuFreqRow>()
+                val rawLevelBlocks = mutableListOf<List<String>>()
 
-                while (i < lines.size && braceDepth > 0) {
-                    val inner = lines[i].trim()
-                    if (isPwrLevelNodeStart(inner)) {
-                        val levelNodeName = inner.substringBefore("{").trim()
-                        val levelIdx = levelNodeName.substringAfter("@", "")
-                            .toIntOrNull() ?: parsedRows.size
-                        var levelDepth = countChar(inner, '{') - countChar(inner, '}')
-                        i++
+                while (i < linesInDts.size && bracket > 0) {
+                    val currentRaw = linesInDts.removeAt(i)
+                    val currentTrimmed = currentRaw.trim()
 
-                        var freqHz = 0L
-                        var voltCode = 128
-                        var busFreq = 0
-                        var busMin = 0
-                        var busMax = 0
-                        var acdLevelHex: String? = null
-                        val extraProps = linkedMapOf<String, String>()
-
-                        while (i < lines.size && levelDepth > 0) {
-                            val propLine = lines[i].trim()
-                            levelDepth += countChar(propLine, '{') - countChar(propLine, '}')
-                            if (levelDepth > 0 && propLine.isNotEmpty() && !propLine.startsWith("}") && propLine.contains("=")) {
-                                val key = propLine.substringBefore("=").trim()
-                                val rawVal = propLine.substringAfter("=").substringBefore(";").trim()
-                                when (key) {
-                                    "qcom,gpu-freq" -> freqHz = parseSingleLongCell(rawVal)
-                                    "qcom,level", "qcom,cx-ipeak" -> voltCode = parseSingleLongCell(rawVal).toInt()
-                                    "qcom,bus-freq" -> busFreq = parseSingleLongCell(rawVal).toInt()
-                                    "qcom,bus-min" -> busMin = parseSingleLongCell(rawVal).toInt()
-                                    "qcom,bus-max" -> busMax = parseSingleLongCell(rawVal).toInt()
-                                    "qcom,acd-level" -> acdLevelHex = extractRawAngleBracketContent(rawVal)
-                                    "reg" -> { /* Rebuild reg from index on serialize */ }
-                                    else -> extraProps[key] = rawVal
-                                }
+                    if (isPwrLevelNodeStart(currentTrimmed)) {
+                        val levelLines = mutableListOf<String>()
+                        var levelBracket = countChar(currentRaw, '{') - countChar(currentRaw, '}')
+                        while (i < linesInDts.size && levelBracket > 0) {
+                            val lvlLine = linesInDts.removeAt(i)
+                            levelBracket += countChar(lvlLine, '{') - countChar(lvlLine, '}')
+                            if (levelBracket > 0) {
+                                levelLines.add(lvlLine.trim())
                             }
-                            i++
                         }
-
-                        if (freqHz > 0L) {
-                            parsedRows.add(
-                                GpuFreqRow(
-                                    id = UUID.randomUUID().toString(),
-                                    levelIndex = levelIdx,
-                                    frequencyHz = freqHz,
-                                    voltageLevelCode = voltCode,
-                                    busFreq = busFreq,
-                                    busMin = busMin,
-                                    busMax = busMax,
-                                    acdLevelHex = acdLevelHex,
-                                    extraProperties = extraProps
-                                )
-                            )
-                        }
+                        rawLevelBlocks.add(levelLines)
                         continue
                     }
 
-                    braceDepth += countChar(inner, '{') - countChar(inner, '}')
-                    if (braceDepth > 0 && inner.contains("=") && !inner.endsWith("{")) {
-                        val key = inner.substringBefore("=").trim()
-                        val rawVal = inner.substringAfter("=").substringBefore(";").trim()
-                        when (key) {
-                            "qcom,gpu-speed-bin" -> speedBinValue = parseSingleLongCell(rawVal).toInt()
-                            "qcom,initial-pwrlevel" -> initialPwrLevel = parseSingleLongCell(rawVal).toInt()
-                            "qcom,throttle-pwrlevel" -> throttlePwrLevel = parseSingleLongCell(rawVal).toInt()
-                            else -> if (key != "compatible" && key != "#address-cells" && key != "#size-cells") {
-                                headerProps[key] = rawVal
+                    bracket += countChar(currentRaw, '{') - countChar(currentRaw, '}')
+                    if (bracket > 0 && currentTrimmed.isNotEmpty()) {
+                        rawHeaderLines.add(currentTrimmed)
+                        if (currentTrimmed.contains("=") && !currentTrimmed.endsWith("{")) {
+                            val key = currentTrimmed.substringBefore("=").trim()
+                            val rawVal = currentTrimmed.substringAfter("=").substringBefore(";").trim()
+                            when (key) {
+                                "qcom,gpu-speed-bin" -> speedBinValue = decodeIntLine(currentTrimmed).toInt()
+                                "qcom,initial-pwrlevel" -> initialPwrLevel = decodeIntLine(currentTrimmed).toInt()
+                                "qcom,throttle-pwrlevel" -> throttlePwrLevel = decodeIntLine(currentTrimmed).toInt()
+                                else -> if (key != "compatible" && key != "#address-cells" && key != "#size-cells") {
+                                    headerProps[key] = rawVal
+                                }
                             }
                         }
                     }
-                    i++
                 }
 
-                if (parsedRows.isNotEmpty()) {
-                    // Maintain descending order from highest frequency to lowest frequency as in Qualcomm DTS
-                    val sortedRows = parsedRows
-                        .sortedByDescending { it.frequencyHz }
-                        .mapIndexed { idx, row -> row.copy(levelIndex = idx) }
+                // Separate visible operating levels (freq > 0) from the trailing 0 Hz idle level
+                // exactly as GpuTableEditor.generateLevels() does in original KonaBess.
+                val visibleRows = mutableListOf<GpuFreqRow>()
+                var trailingZeroLevelLines: List<String>? = null
+
+                rawLevelBlocks.forEachIndexed { idx, lvlLines ->
+                    val freqLine = lvlLines.firstOrNull { it.startsWith("qcom,gpu-freq") }
+                    val freqHz = if (freqLine != null) decodeIntLine(freqLine) else 0L
+
+                    if (freqHz == 0L && idx == rawLevelBlocks.lastIndex) {
+                        trailingZeroLevelLines = lvlLines
+                    } else if (freqHz > 0L) {
+                        var voltCode = 0
+                        var busFreq = 0
+                        var busMin = 0
+                        var busMax = 0
+                        var acdHex: String? = null
+                        val extraProps = linkedMapOf<String, String>()
+
+                        for (prop in lvlLines) {
+                            if (!prop.contains("=")) continue
+                            val key = prop.substringBefore("=").trim()
+                            val rawVal = prop.substringAfter("=").substringBefore(";").trim()
+                            when (key) {
+                                "qcom,gpu-freq" -> { /* already parsed */ }
+                                "qcom,level", "qcom,cx-ipeak" -> voltCode = decodeIntLine(prop).toInt()
+                                "qcom,bus-freq" -> busFreq = decodeIntLine(prop).toInt()
+                                "qcom,bus-min" -> busMin = decodeIntLine(prop).toInt()
+                                "qcom,bus-max" -> busMax = decodeIntLine(prop).toInt()
+                                "qcom,acd-level" -> acdHex = decodeHexLine(prop)
+                                "reg" -> { /* regenerated on genTable() */ }
+                                else -> extraProps[key] = rawVal
+                            }
+                        }
+
+                        visibleRows.add(
+                            GpuFreqRow(
+                                id = UUID.randomUUID().toString(),
+                                levelIndex = visibleRows.size,
+                                frequencyHz = freqHz,
+                                voltageLevelCode = voltCode,
+                                busFreq = busFreq,
+                                busMin = busMin,
+                                busMax = busMax,
+                                acdLevelHex = acdHex,
+                                extraProperties = extraProps,
+                                rawLines = lvlLines
+                            )
+                        )
+                    }
+                }
+
+                if (visibleRows.isNotEmpty()) {
+                    val indexedRows = visibleRows.mapIndexed { idx, r -> r.copy(levelIndex = idx) }
                     bins.add(
                         GpuPowerBin(
-                            binIndex = explicitBinIdx,
+                            binIndex = binId,
                             nodeName = nodeName,
                             speedBinValue = speedBinValue,
                             initialPwrLevel = initialPwrLevel,
                             throttlePwrLevel = throttlePwrLevel,
                             headerProperties = headerProps,
-                            levels = sortedRows,
-                            stockLevels = sortedRows.map { it.copy() }
+                            rawHeaderLines = rawHeaderLines,
+                            levels = indexedRows,
+                            stockLevels = indexedRows.map { it.copy() },
+                            trailingZeroFreqLevelLines = trailingZeroLevelLines
                         )
                     )
-                    binCounter++
+                    fallbackBinCounter++
                 }
                 continue
             }
             i++
         }
 
-        return bins
-    }
-
-    private fun parseOppVoltTable(lines: List<String>): List<GpuOppVoltRow> {
-        val oppRows = mutableListOf<GpuOppVoltRow>()
-        var i = 0
-        while (i < lines.size) {
-            val trimmed = lines[i].trim()
-            if (trimmed.startsWith("qcom,gpu-opp-table") || trimmed.startsWith("gpu-opp-table") || trimmed.startsWith("opp-table")) {
-                if (trimmed.contains("{")) {
-                    var braceDepth = countChar(trimmed, '{') - countChar(trimmed, '}')
-                    i++
-                    while (i < lines.size && braceDepth > 0) {
-                        val inner = lines[i].trim()
-                        if (inner.startsWith("opp-") && inner.contains("{")) {
-                            val nodeName = inner.substringBefore("{").trim()
-                            var oppDepth = countChar(inner, '{') - countChar(inner, '}')
-                            i++
-                            var freqHz = 0L
-                            var microvolt = 0L
-                            var peakBw: Long? = null
-                            while (i < lines.size && oppDepth > 0) {
-                                val prop = lines[i].trim()
-                                oppDepth += countChar(prop, '{') - countChar(prop, '}')
-                                if (oppDepth > 0 && prop.contains("=")) {
-                                    val key = prop.substringBefore("=").trim()
-                                    val rawVal = prop.substringAfter("=").substringBefore(";").trim()
-                                    when (key) {
-                                        "opp-hz" -> freqHz = parseMultiCell64BitOrSingle(rawVal)
-                                        "opp-microvolt" -> microvolt = parseSingleLongCell(rawVal)
-                                        "opp-peak-kBps" -> peakBw = parseSingleLongCell(rawVal)
-                                    }
-                                }
-                                i++
-                            }
-                            if (freqHz > 0L) {
-                                oppRows.add(
-                                    GpuOppVoltRow(
-                                        id = UUID.randomUUID().toString(),
-                                        nodeName = nodeName,
-                                        frequencyHz = freqHz,
-                                        microvoltOrLevel = microvolt,
-                                        peakKbps = peakBw,
-                                        stockMicrovoltOrLevel = microvolt
-                                    )
-                                )
-                            }
-                            continue
-                        }
-                        braceDepth += countChar(inner, '{') - countChar(inner, '}')
-                        i++
-                    }
-                    continue
-                }
-            }
-            i++
-        }
-        return oppRows.sortedByDescending { it.frequencyHz }
+        return Pair(bins, binPosition)
     }
 
     /**
-     * Serializes the workspace back into valid Qualcomm Device Tree Source (.dts) format.
+     * Exact port of `GpuVoltEditor.decode()` for chips that use `gpu-opp-table` (`kona`, `msmnile`, `lito`, `lagoon`).
+     */
+    private fun decodeAndExtractOppVoltTable(
+        linesInDts: MutableList<String>
+    ): Triple<List<GpuOppVoltRow>, Int, List<String>> {
+        val oppRows = mutableListOf<GpuOppVoltRow>()
+        val headerLines = mutableListOf<String>()
+        var voltPosition = -1
+        var i = 0
+
+        while (i < linesInDts.size) {
+            val trimmed = linesInDts[i].trim()
+            if ((trimmed.startsWith("gpu-opp-table {") || trimmed.startsWith("qcom,gpu-opp-table {")) && voltPosition < 0) {
+                voltPosition = i
+                val openLine = linesInDts.removeAt(i)
+                var bracket = countChar(openLine, '{') - countChar(openLine, '}')
+                while (i < linesInDts.size && bracket > 0) {
+                    val currentRaw = linesInDts.removeAt(i)
+                    val currentTrimmed = currentRaw.trim()
+                    if (currentTrimmed.startsWith("opp-") && currentTrimmed.contains("{")) {
+                        val nodeName = currentTrimmed.substringBefore("{").trim()
+                        var oppBracket = countChar(currentRaw, '{') - countChar(currentRaw, '}')
+                        var freqHz = 0L
+                        var microvolt = 0L
+                        var peakBw: Long? = null
+                        while (i < linesInDts.size && oppBracket > 0) {
+                            val propRaw = linesInDts.removeAt(i)
+                            val prop = propRaw.trim()
+                            oppBracket += countChar(propRaw, '{') - countChar(propRaw, '}')
+                            if (oppBracket > 0 && prop.contains("=")) {
+                                val key = prop.substringBefore("=").trim()
+                                when (key) {
+                                    "opp-hz" -> freqHz = decodeIntLine(prop)
+                                    "opp-microvolt" -> microvolt = decodeIntLine(prop)
+                                    "opp-peak-kBps" -> peakBw = decodeIntLine(prop)
+                                }
+                            }
+                        }
+                        if (freqHz > 0L) {
+                            oppRows.add(
+                                GpuOppVoltRow(
+                                    id = UUID.randomUUID().toString(),
+                                    nodeName = nodeName,
+                                    frequencyHz = freqHz,
+                                    microvoltOrLevel = microvolt,
+                                    peakKbps = peakBw,
+                                    stockMicrovoltOrLevel = microvolt
+                                )
+                            )
+                        }
+                        continue
+                    }
+                    bracket += countChar(currentRaw, '{') - countChar(currentRaw, '}')
+                    if (bracket > 0 && currentTrimmed.isNotEmpty()) {
+                        headerLines.add(currentTrimmed)
+                    }
+                }
+                break
+            }
+            i++
+        }
+
+        return Triple(oppRows, voltPosition, headerLines)
+    }
+
+    /**
+     * Generates the DTS lines for all `qcom,gpu-pwrlevels` bins, matching `GpuTableEditor.genTable()`
+     * from `libxzr/KonaBess` (including restoring the hidden trailing 0 Hz idle level).
+     */
+    fun generateBinsTableLines(workspace: ParsedDtsWorkspace): List<String> {
+        val lines = mutableListOf<String>()
+        val levelKey = workspace.chipProfile.levelPropertyKey
+        val isSingleBin = workspace.chipProfile.chipType.isSingleBin && workspace.bins.size == 1
+
+        workspace.bins.forEach { bin ->
+            val binOpenName = when {
+                bin.nodeName.isNotBlank() -> bin.nodeName
+                isSingleBin -> "qcom,gpu-pwrlevels"
+                else -> "qcom,gpu-pwrlevels-${bin.binIndex}"
+            }
+            lines.add("$binOpenName {")
+
+            if (bin.rawHeaderLines.isNotEmpty()) {
+                for (hdr in bin.rawHeaderLines) {
+                    val key = hdr.substringBefore("=").trim()
+                    when (key) {
+                        "qcom,initial-pwrlevel" ->
+                            lines.add("    qcom,initial-pwrlevel = <0x${bin.initialPwrLevel.toString(16)}>;")
+                        "qcom,throttle-pwrlevel" ->
+                            if (bin.throttlePwrLevel != null) {
+                                lines.add("    qcom,throttle-pwrlevel = <0x${bin.throttlePwrLevel.toString(16)}>;")
+                            } else {
+                                lines.add("    $hdr")
+                            }
+                        else -> lines.add("    $hdr")
+                    }
+                }
+            } else {
+                lines.add("    compatible = \"qcom,gpu-pwrlevels\";")
+                if (bin.speedBinValue != null) {
+                    lines.add("    qcom,gpu-speed-bin = <0x${bin.speedBinValue.toString(16)}>;")
+                }
+                lines.add("    qcom,initial-pwrlevel = <0x${bin.initialPwrLevel.toString(16)}>;")
+                if (bin.throttlePwrLevel != null) {
+                    lines.add("    qcom,throttle-pwrlevel = <0x${bin.throttlePwrLevel.toString(16)}>;")
+                }
+                bin.headerProperties.forEach { (k, v) ->
+                    lines.add("    $k = $v;")
+                }
+            }
+
+            bin.levels.forEachIndexed { idx, row ->
+                lines.add("    qcom,gpu-pwrlevel@$idx {")
+                if (row.rawLines.isNotEmpty()) {
+                    var wroteReg = false
+                    var wroteFreq = false
+                    var wroteLevel = false
+                    var wroteBusFreq = false
+                    var wroteBusMin = false
+                    var wroteBusMax = false
+                    var wroteAcd = false
+
+                    for (origLine in row.rawLines) {
+                        val key = origLine.substringBefore("=").trim()
+                        when (key) {
+                            "reg" -> {
+                                lines.add("        reg = <0x${idx.toString(16)}>;")
+                                wroteReg = true
+                            }
+                            "qcom,gpu-freq" -> {
+                                lines.add("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
+                                wroteFreq = true
+                            }
+                            "qcom,level", "qcom,cx-ipeak" -> {
+                                lines.add("        $key = <0x${row.voltageLevelCode.toString(16)}>;")
+                                wroteLevel = true
+                            }
+                            "qcom,bus-freq" -> {
+                                lines.add("        qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
+                                wroteBusFreq = true
+                            }
+                            "qcom,bus-min" -> {
+                                lines.add("        qcom,bus-min = <0x${row.busMin.toString(16)}>;")
+                                wroteBusMin = true
+                            }
+                            "qcom,bus-max" -> {
+                                lines.add("        qcom,bus-max = <0x${row.busMax.toString(16)}>;")
+                                wroteBusMax = true
+                            }
+                            "qcom,acd-level" -> {
+                                if (!row.acdLevelHex.isNullOrBlank()) {
+                                    lines.add("        qcom,acd-level = <${ formatHexWithPrefix(row.acdLevelHex) }>;")
+                                }
+                                wroteAcd = true
+                            }
+                            else -> lines.add("        $origLine")
+                        }
+                    }
+                    if (!wroteReg) lines.add(1, "        reg = <0x${idx.toString(16)}>;")
+                    if (!wroteFreq) lines.add("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
+                    if (!wroteLevel) lines.add("        $levelKey = <0x${row.voltageLevelCode.toString(16)}>;")
+                    if (!wroteBusFreq) lines.add("        qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
+                    if (!wroteBusMin) lines.add("        qcom,bus-min = <0x${row.busMin.toString(16)}>;")
+                    if (!wroteBusMax) lines.add("        qcom,bus-max = <0x${row.busMax.toString(16)}>;")
+                    if (!wroteAcd && !row.acdLevelHex.isNullOrBlank()) {
+                        lines.add("        qcom,acd-level = <${ formatHexWithPrefix(row.acdLevelHex) }>;")
+                    }
+                } else {
+                    lines.add("        reg = <0x${idx.toString(16)}>;")
+                    lines.add("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
+                    lines.add("        $levelKey = <0x${row.voltageLevelCode.toString(16)}>;")
+                    lines.add("        qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
+                    lines.add("        qcom,bus-min = <0x${row.busMin.toString(16)}>;")
+                    lines.add("        qcom,bus-max = <0x${row.busMax.toString(16)}>;")
+                    if (!row.acdLevelHex.isNullOrBlank()) {
+                        lines.add("        qcom,acd-level = <${ formatHexWithPrefix(row.acdLevelHex) }>;")
+                    }
+                    row.extraProperties.forEach { (k, v) ->
+                        lines.add("        $k = $v;")
+                    }
+                }
+                lines.add("    };")
+            }
+
+            // Re-emit the untouched trailing 0 Hz idle level at index `bin.levels.size`
+            val trailingZero = bin.trailingZeroFreqLevelLines
+            if (trailingZero != null) {
+                val zeroIdx = bin.levels.size
+                lines.add("    qcom,gpu-pwrlevel@$zeroIdx {")
+                for (zLine in trailingZero) {
+                    val key = zLine.substringBefore("=").trim()
+                    if (key == "reg") {
+                        lines.add("        reg = <0x${zeroIdx.toString(16)}>;")
+                    } else {
+                        lines.add("        $zLine")
+                    }
+                }
+                lines.add("    };")
+            }
+
+            lines.add("};")
+        }
+
+        return lines
+    }
+
+    private fun generateOppVoltTableLines(workspace: ParsedDtsWorkspace): List<String> {
+        if (workspace.oppVoltRows.isEmpty()) return emptyList()
+        val lines = mutableListOf<String>()
+        lines.add("gpu-opp-table {")
+        if (workspace.oppTableHeaderLines.isNotEmpty()) {
+            workspace.oppTableHeaderLines.forEach { lines.add("    $it") }
+        } else {
+            lines.add("    compatible = \"operating-points-v2\";")
+        }
+        workspace.oppVoltRows.forEachIndexed { index, opp ->
+            val nodeName = if (opp.nodeName.isNotBlank()) opp.nodeName else "opp-$index"
+            lines.add("    $nodeName {")
+            lines.add("        opp-hz = <0x0 0x${opp.frequencyHz.toString(16)}>;")
+            lines.add("        opp-microvolt = <0x${opp.microvoltOrLevel.toString(16)}>;")
+            if (opp.peakKbps != null) {
+                lines.add("        opp-peak-kBps = <0x${opp.peakKbps.toString(16)}>;")
+            }
+            lines.add("    };")
+        }
+        lines.add("};")
+        return lines
+    }
+
+    /**
+     * Exact port of `GpuTableEditor.genBack(genTable())` + `GpuVoltEditor.genBack(genTable())`:
+     * Splices the modified GPU frequency and OPP tables back into the original unpacked `.dts` lines
+     * at their exact original positions (`binSplicePosition` and `voltSplicePosition`).
      */
     fun serializeToDts(workspace: ParsedDtsWorkspace): String {
+        val binLines = generateBinsTableLines(workspace)
+        if (workspace.originalDtsLinesConsideringSplice.isNotEmpty() && workspace.binSplicePosition >= 0) {
+            val result = ArrayList(workspace.originalDtsLinesConsideringSplice)
+            val safeBinPos = workspace.binSplicePosition.coerceIn(0, result.size)
+            val oppLines = generateOppVoltTableLines(workspace)
+
+            if (workspace.voltSplicePosition >= 0 && oppLines.isNotEmpty()) {
+                if (workspace.voltSplicePosition <= safeBinPos) {
+                    val safeVoltPos = workspace.voltSplicePosition.coerceIn(0, result.size)
+                    result.addAll(safeVoltPos, oppLines)
+                    val shiftedBinPos = (safeBinPos + oppLines.size).coerceIn(0, result.size)
+                    result.addAll(shiftedBinPos, binLines)
+                } else {
+                    result.addAll(safeBinPos, binLines)
+                    val shiftedVoltPos = (workspace.voltSplicePosition + binLines.size).coerceIn(0, result.size)
+                    result.addAll(shiftedVoltPos, oppLines)
+                }
+            } else {
+                result.addAll(safeBinPos, binLines)
+            }
+            return result.joinToString("\n")
+        }
+
+        // Fallback if workspace was constructed from a bare snippet without surrounding DTB
         val sb = StringBuilder()
         val profile = workspace.chipProfile
         sb.appendLine("/dts-v1/;")
-        sb.appendLine()
         sb.appendLine("/ {")
         sb.appendLine("    model = \"${profile.modelName}\";")
         if (profile.compatibleTokens.isNotEmpty()) {
@@ -286,63 +642,11 @@ object DtsParser {
         if (!profile.msmIdHex.isNullOrBlank()) {
             sb.appendLine("    qcom,msm-id = <${profile.msmIdHex}>;")
         }
-        sb.appendLine()
         sb.appendLine("    qcom,kgsl-3d0@3d00000 {")
-        sb.appendLine("        compatible = \"qcom,kgsl-3d0\";")
-
-        if (workspace.oppVoltRows.isNotEmpty()) {
-            sb.appendLine()
-            sb.appendLine("        qcom,gpu-opp-table {")
-            sb.appendLine("            compatible = \"operating-points-v2\";")
-            workspace.oppVoltRows.sortedByDescending { it.frequencyHz }.forEach { opp ->
-                sb.appendLine("            opp-${opp.frequencyHz} {")
-                sb.appendLine("                opp-hz = <0x0 0x${opp.frequencyHz.toString(16)}>;")
-                sb.appendLine("                opp-microvolt = <0x${opp.microvoltOrLevel.toString(16)}>;")
-                if (opp.peakKbps != null) {
-                    sb.appendLine("                opp-peak-kBps = <0x${opp.peakKbps.toString(16)}>;")
-                }
-                sb.appendLine("            };")
-            }
-            sb.appendLine("        };")
-        }
-
-        sb.appendLine()
+        val oppLines = generateOppVoltTableLines(workspace)
+        oppLines.forEach { sb.appendLine("        $it") }
         sb.appendLine("        qcom,gpu-pwrlevel-bins {")
-        workspace.bins.forEach { bin ->
-            sb.appendLine("            ${bin.nodeName} {")
-            sb.appendLine("                compatible = \"qcom,gpu-pwrlevels\";")
-            sb.appendLine("                #address-cells = <0x1>;")
-            sb.appendLine("                #size-cells = <0x0>;")
-            if (bin.speedBinValue != null) {
-                sb.appendLine("                qcom,gpu-speed-bin = <0x${bin.speedBinValue.toString(16)}>;")
-            }
-            sb.appendLine("                qcom,initial-pwrlevel = <0x${bin.initialPwrLevel.toString(16)}>;")
-            if (bin.throttlePwrLevel != null) {
-                sb.appendLine("                qcom,throttle-pwrlevel = <0x${bin.throttlePwrLevel.toString(16)}>;")
-            }
-            bin.headerProperties.forEach { (k, v) ->
-                sb.appendLine("                $k = $v;")
-            }
-            sb.appendLine()
-
-            bin.levels.forEachIndexed { idx, row ->
-                sb.appendLine("                qcom,gpu-pwrlevel@$idx {")
-                sb.appendLine("                    reg = <0x${idx.toString(16)}>;")
-                sb.appendLine("                    qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
-                sb.appendLine("                    ${profile.levelPropertyKey} = <0x${row.voltageLevelCode.toString(16)}>;")
-                sb.appendLine("                    qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
-                sb.appendLine("                    qcom,bus-min = <0x${row.busMin.toString(16)}>;")
-                sb.appendLine("                    qcom,bus-max = <0x${row.busMax.toString(16)}>;")
-                if (!row.acdLevelHex.isNullOrBlank()) {
-                    sb.appendLine("                    qcom,acd-level = <${row.acdLevelHex}>;")
-                }
-                row.extraProperties.forEach { (k, v) ->
-                    sb.appendLine("                    $k = $v;")
-                }
-                sb.appendLine("                };")
-            }
-            sb.appendLine("            };")
-        }
+        binLines.forEach { sb.appendLine("            $it") }
         sb.appendLine("        };")
         sb.appendLine("    };")
         sb.appendLine("};")
@@ -350,39 +654,134 @@ object DtsParser {
     }
 
     /**
-     * Exports a single bin or entire GPU table in KonaBess shareable config format.
+     * Exports a `konabess://` Gzip+Base64 config string (100% compatible with `libxzr/KonaBess` `TableIO`)
+     * as well as readable DTS preview lines.
      */
     fun exportKonaBessConfig(workspace: ParsedDtsWorkspace, binIndex: Int): String {
-        val bin = workspace.bins.firstOrNull { it.binIndex == binIndex } ?: workspace.bins.first()
+        val bin = workspace.bins.firstOrNull { it.binIndex == binIndex } ?: workspace.bins.firstOrNull()
+            ?: return "# No GPU bin loaded"
         val profile = workspace.chipProfile
         val sb = StringBuilder()
         sb.appendLine("# SageKonaBess GPU Frequency & Voltage Configuration")
-        sb.appendLine("# Device Read Model: ${profile.modelName}")
-        sb.appendLine("# Target Bin: ${bin.nodeName}")
-        sb.appendLine("# Level Key: ${profile.levelPropertyKey}")
+        sb.appendLine("# Chip: ${profile.modelName} (${profile.chipType.name})")
+        sb.appendLine("# Bin: ${KnownRpmhLabels.formatBinDisplayName(bin.binIndex, profile.chipType)}")
         sb.appendLine()
-        sb.appendLine("${bin.nodeName} {")
-        sb.appendLine("    qcom,initial-pwrlevel = <0x${bin.initialPwrLevel.toString(16)}>;")
-        bin.levels.forEachIndexed { idx, row ->
-            val labelComment = profile.resolveLabel(row.voltageLevelCode)
-            sb.appendLine("    qcom,gpu-pwrlevel@$idx { /* ${row.frequencyMHz}MHz -> $labelComment */")
-            sb.appendLine("        reg = <0x${idx.toString(16)}>;")
-            sb.appendLine("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
-            sb.appendLine("        ${profile.levelPropertyKey} = <0x${row.voltageLevelCode.toString(16)}>;")
-            sb.appendLine("        qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
-            sb.appendLine("        qcom,bus-min = <0x${row.busMin.toString(16)}>;")
-            sb.appendLine("        qcom,bus-max = <0x${row.busMax.toString(16)}>;")
-            if (!row.acdLevelHex.isNullOrBlank()) {
-                sb.appendLine("        qcom,acd-level = <${row.acdLevelHex}>;")
-            }
-            sb.appendLine("    };")
+        val uriPayload = exportKonaBessUri(workspace)
+        if (uriPayload.isNotBlank()) {
+            sb.appendLine(uriPayload)
+            sb.appendLine()
         }
-        sb.appendLine("};")
+        val singleBinWorkspace = workspace.copy(bins = listOf(bin))
+        generateBinsTableLines(singleBinWorkspace).forEach { sb.appendLine(it) }
         return sb.toString()
     }
 
-    private fun isBinNodeStart(line: String): Boolean {
-        return (line.startsWith("qcom,gpu-pwrlevels") && line.contains("{") && !line.startsWith("qcom,gpu-pwrlevel-bins"))
+    /**
+     * Generates the exact `konabess://` Gzip + Base64 string used by `libxzr/KonaBess` `TableIO`.
+     */
+    fun exportKonaBessUri(workspace: ParsedDtsWorkspace): String {
+        if (workspace.bins.isEmpty()) return ""
+        return try {
+            val tableLines = generateBinsTableLines(workspace).joinToString("\n")
+            val bos = ByteArrayOutputStream()
+            GZIPOutputStream(bos).use { gzip ->
+                gzip.write(tableLines.toByteArray(StandardCharsets.UTF_8))
+            }
+            "konabess://" + Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * Decodes a `konabess://` Gzip + Base64 string from `libxzr/KonaBess` `TableIO` if present.
+     */
+    fun decodeKonaBessUriIfPresent(rawText: String): String {
+        val trimmed = rawText.trim()
+        val uriLine = trimmed.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("konabess://") }
+            ?: return trimmed
+
+        return try {
+            val base64Part = uriLine.removePrefix("konabess://").trim()
+            val compressed = Base64.decode(base64Part, Base64.DEFAULT)
+            GZIPInputStream(ByteArrayInputStream(compressed)).bufferedReader(StandardCharsets.UTF_8).use {
+                it.readText()
+            }
+        } catch (_: Exception) {
+            trimmed
+        }
+    }
+
+    /**
+     * Exact port of `DtsHelper.decode_int_line` + `DtsHelper.decode_stringed_int` from `libxzr/KonaBess`.
+     *
+     * Handles both standard `<0x...>` cells AND the `dtc` decompiler quirk where 32-bit integers
+     * whose lowest byte is `0x00` and upper 3 bytes are ASCII characters get decompiled as `"..."`!
+     */
+    fun decodeIntLine(line: String): Long {
+        val trimmed = line.trim().removeSuffix(";")
+        val eqIdx = trimmed.indexOf('=')
+        if (eqIdx < 0) return 0L
+        val rhs = trimmed.substring(eqIdx + 1).trim()
+        if (rhs.startsWith("\"")) {
+            return decodeStringedInt(rhs)
+        }
+        val openIdx = rhs.indexOf('<')
+        val closeIdx = rhs.indexOf('>')
+        val inside = if (openIdx >= 0 && closeIdx > openIdx) {
+            rhs.substring(openIdx + 1, closeIdx).trim()
+        } else {
+            rhs
+        }
+        val tokens = inside.split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.size >= 2) {
+            val high = parseHexOrDec(tokens[tokens.size - 2])
+            val low = parseHexOrDec(tokens.last())
+            return (high shl 32) or (low and 0xFFFFFFFFL)
+        }
+        return parseHexOrDec(tokens.firstOrNull().orEmpty())
+    }
+
+    /**
+     * Exact port of `DtsHelper.decode_stringed_int` from `libxzr/KonaBess`.
+     * When a 32-bit cell in DTB has 3 printable ASCII bytes followed by `0x00`, `dtc` outputs `"abc"`.
+     */
+    fun decodeStringedInt(input: String): Long {
+        val str = input.trim().removeSurrounding("\"")
+        // Unescape simple C escapes if any, or read raw chars as DtsHelper.decode_stringed_int does
+        if (str.length < 3) return 0L
+        val c0 = str[0].code.toLong() and 0xFFL
+        val c1 = str[1].code.toLong() and 0xFFL
+        val c2 = str[2].code.toLong() and 0xFFL
+        return (c0 shl 24) or (c1 shl 16) or (c2 shl 8)
+    }
+
+    fun decodeHexLine(line: String): String {
+        val openIdx = line.indexOf('<')
+        val closeIdx = line.indexOf('>')
+        return if (openIdx >= 0 && closeIdx > openIdx) {
+            line.substring(openIdx + 1, closeIdx).trim()
+        } else {
+            line.substringAfter("=").removeSuffix(";").trim()
+        }
+    }
+
+    private fun formatHexWithPrefix(hexValue: String): String {
+        val clean = hexValue.trim()
+        return if (clean.startsWith("0x", ignoreCase = true) || clean.contains(" ")) {
+            clean
+        } else {
+            "0x$clean"
+        }
+    }
+
+    private fun isBinNodeStart(line: String, isSingleBin: Boolean): Boolean {
+        if (line.startsWith("qcom,gpu-pwrlevel-bins")) return false
+        if (isSingleBin && line.startsWith("qcom,gpu-pwrlevels {")) return true
+        return line.startsWith("qcom,gpu-pwrlevels-") && line.contains("{") ||
+            line.startsWith("qcom,gpu-pwrlevels {")
     }
 
     private fun isPwrLevelNodeStart(line: String): Boolean {
@@ -396,32 +795,11 @@ object DtsParser {
         return regex.findAll(line).map { it.groupValues[1] }.toList()
     }
 
-    private fun extractRawAngleBracketContent(line: String): String {
-        return line.substringAfter("<", "").substringBefore(">", "").trim()
-    }
-
-    private fun parseSingleLongCell(rawVal: String): Long {
-        val inside = extractRawAngleBracketContent(rawVal).ifEmpty { rawVal.trim() }
-        val token = inside.split(Regex("\\s+")).lastOrNull().orEmpty().trim()
-        return parseHexOrDec(token)
-    }
-
-    private fun parseMultiCell64BitOrSingle(rawVal: String): Long {
-        val inside = extractRawAngleBracketContent(rawVal).ifEmpty { rawVal.trim() }
-        val tokens = inside.split(Regex("\\s+")).filter { it.isNotBlank() }
-        if (tokens.size >= 2) {
-            val high = parseHexOrDec(tokens[0])
-            val low = parseHexOrDec(tokens[1])
-            return (high shl 32) or (low and 0xFFFFFFFFL)
-        }
-        return parseHexOrDec(tokens.firstOrNull().orEmpty())
-    }
-
     private fun parseHexOrDec(token: String): Long {
         val clean = token.trim()
         if (clean.isEmpty()) return 0L
         return if (clean.startsWith("0x", ignoreCase = true)) {
-            clean.substring(2).toLongOrNull(16) ?: 0L
+            java.lang.Long.decode(clean)
         } else {
             clean.toLongOrNull() ?: 0L
         }

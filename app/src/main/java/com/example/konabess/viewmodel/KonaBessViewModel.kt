@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.konabess.core.DtsParser
 import com.example.konabess.core.KonaBessShellEngine
 import com.example.konabess.core.VoltageStepShifter
+import com.example.konabess.model.DetectedDtb
+import com.example.konabess.model.DynamicChipProfile
 import com.example.konabess.model.GpuFreqRow
 import com.example.konabess.model.GpuOppVoltRow
 import com.example.konabess.model.GpuPowerBin
@@ -32,7 +34,9 @@ enum class KonaBessTab {
 data class KonaBessUiState(
     val isLoading: Boolean = false,
     val hasRootAccess: Boolean = false,
-    val activePartition: String = "boot / vendor_boot",
+    val activePartition: String = "vendor_boot / boot",
+    val detectedDtbs: List<DetectedDtb> = emptyList(),
+    val selectedDtbId: Int = -1,
     val workspace: ParsedDtsWorkspace,
     val selectedBinIndex: Int = 0,
     val selectedTab: KonaBessTab = KonaBessTab.FREQ_TABLE,
@@ -60,17 +64,18 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     private val stepHistoryByBin = mutableMapOf<Int, ArrayDeque<List<GpuFreqRow>>>()
     private val oppStepHistory = ArrayDeque<List<GpuOppVoltRow>>()
 
-    private val initialDts = shellEngine.buildDefaultReadDeviceDts()
-    private val initialWorkspace = DtsParser.parseDts(initialDts, "boot / vendor_boot")
+    // Untouched stock DTS string unpacked from the device DTB (or imported baseline)
+    private var untouchedStockDts: String = ""
+
+    private val emptyWorkspace = DtsParser.parseDts("", "vendor_boot / boot")
 
     private val _uiState = MutableStateFlow(
         KonaBessUiState(
-            workspace = initialWorkspace,
-            selectedBinIndex = initialWorkspace.bins.firstOrNull()?.binIndex ?: 0,
+            isLoading = true,
+            workspace = emptyWorkspace,
+            selectedBinIndex = 0,
             shellLogs = listOf(
-                "[Init] Read existing GPU frequency & voltage table from device DTB.",
-                "[Init] Derived ${initialWorkspace.chipProfile.readVoltageLevels.size} active voltage levels from existing values: " +
-                    initialWorkspace.chipProfile.readVoltageLevels.joinToString(", ") { it.label }
+                "[Init] Initializing KonaBess Core (magiskboot + dtc)..."
             )
         )
     )
@@ -80,33 +85,91 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         unpackDeviceImage(forceReloadStock = false)
     }
 
-    fun unpackDeviceImage(forceReloadStock: Boolean = false) {
+    fun unpackDeviceImage(forceReloadStock: Boolean = false, preferredDtbId: Int? = null) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            val result = shellEngine.unpackAndReadDeviceDts(forceReloadStock)
-            val parsed = DtsParser.parseDts(result.dtsContent, result.activePartition)
-            if (forceReloadStock) {
-                stepHistoryByBin.clear()
-                oppStepHistory.clear()
+            val result = shellEngine.unpackAndReadDeviceDts(
+                forceReloadFromPartition = forceReloadStock,
+                preferredDtbId = preferredDtbId
+            )
+
+            if (result.dtsContent.isBlank()) {
+                _uiState.update { state ->
+                    state.copy(
+                        isLoading = false,
+                        hasRootAccess = result.hasRootAccess,
+                        activePartition = result.activePartition,
+                        detectedDtbs = result.detectedDtbs,
+                        selectedDtbId = result.selectedDtbId,
+                        statusBannerMessage = if (result.hasRootAccess) {
+                            "Could not find Qualcomm GPU power levels in boot/vendor_boot. Import a .dts or konabess:// config."
+                        } else {
+                            "Root access (su) required to unpack device boot/vendor_boot. Grant root & tap Re-Read, or import a config."
+                        },
+                        isStatusHighlightSuccess = false,
+                        shellLogs = state.shellLogs + result.logs
+                    )
+                }
+                return@launch
             }
-            val firstBin = parsed.bins.firstOrNull()?.binIndex ?: 0
-            val levelSummary = parsed.chipProfile.readVoltageLevels.joinToString(", ") { it.label }
+
+            untouchedStockDts = result.stockDtsContent.ifBlank { result.dtsContent }
+            val stockParsed = DtsParser.parseDts(
+                untouchedStockDts,
+                result.activePartition,
+                result.selectedDtbId
+            )
+            val activeParsed = if (forceReloadStock || result.dtsContent == untouchedStockDts) {
+                stockParsed
+            } else {
+                val currentParsed = DtsParser.parseDts(
+                    result.dtsContent,
+                    result.activePartition,
+                    result.selectedDtbId
+                )
+                // Always attach the authentic untouched stockLevels from .dts.stock
+                val mergedBins = currentParsed.bins.map { bin ->
+                    val matchingStockBin = stockParsed.bins.firstOrNull { it.binIndex == bin.binIndex }
+                    if (matchingStockBin != null) {
+                        bin.copy(stockLevels = matchingStockBin.stockLevels.map { it.copy() })
+                    } else {
+                        bin
+                    }
+                }
+                currentParsed.copy(bins = mergedBins)
+            }
+
+            stepHistoryByBin.clear()
+            oppStepHistory.clear()
+
+            val firstBin = activeParsed.bins.firstOrNull()?.binIndex ?: 0
+            val levelSummary = activeParsed.chipProfile.readVoltageLevels.joinToString(", ") { it.label }
+            val freqSummary = activeParsed.bins.firstOrNull()?.levels?.joinToString(", ") { "${it.frequencyMHz}MHz" }.orEmpty()
+
             _uiState.update { state ->
                 state.copy(
                     isLoading = false,
                     hasRootAccess = result.hasRootAccess,
                     activePartition = result.activePartition,
-                    workspace = parsed,
+                    detectedDtbs = result.detectedDtbs,
+                    selectedDtbId = result.selectedDtbId,
+                    workspace = activeParsed,
                     selectedBinIndex = firstBin,
-                    netStepDropsByBin = if (forceReloadStock) emptyMap() else state.netStepDropsByBin,
-                    statusBannerMessage = "Read ${parsed.bins.size} GPU bin(s) & ${parsed.chipProfile.readVoltageLevels.size} existing voltage levels from device.",
+                    netStepDropsByBin = emptyMap(),
+                    statusBannerMessage = "Unpacked ${activeParsed.chipProfile.modelName}: ${activeParsed.bins.size} bin(s), ${activeParsed.bins.firstOrNull()?.levels?.size ?: 0} stock frequencies.",
                     isStatusHighlightSuccess = true,
                     shellLogs = state.shellLogs + result.logs + listOf(
-                        "[Parser] Existing voltage levels read: $levelSummary"
+                        "[Stock Freqs] $freqSummary",
+                        "[Stock Levels] $levelSummary"
                     )
                 )
             }
         }
+    }
+
+    fun selectDtb(dtbId: Int) {
+        if (dtbId == _uiState.value.selectedDtbId) return
+        unpackDeviceImage(forceReloadStock = false, preferredDtbId = dtbId)
     }
 
     fun selectBin(binIndex: Int) {
@@ -120,7 +183,7 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     /**
      * One-Tap Voltage Step Drop (-1 Step):
      * Drops every frequency's voltage level to the next lower frequency step's existing voltage
-     * level, while strictly keeping the 2 bottom frequencies unchanged.
+     * level, while strictly keeping the 2 bottom visible frequencies (e.g. 295MHz & 220MHz) unchanged.
      */
     fun dropAllVoltagesOneStep() {
         val state = _uiState.value
@@ -151,7 +214,6 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
             state.workspace.oppVoltRows
         }
 
-        // Build sample log entry highlighting e.g. 719MHz shift
         val sampleRowIdx = currentRows.indexOfFirst { it.frequencyMHz == 719L }.takeIf { it >= 0 } ?: 0
         val beforeCode = currentRows[sampleRowIdx].voltageLevelCode
         val afterCode = shiftResult.updatedRows[sampleRowIdx].voltageLevelCode
@@ -162,7 +224,13 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(levels = shiftResult.updatedRows) else b
         }
+        val updatedWorkspace = state.workspace.copy(
+            bins = updatedBins,
+            oppVoltRows = updatedOppRows
+        )
         val newNetDrops = (state.netStepDropsByBin[bin.binIndex] ?: 0) + 1
+
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         appendLog(
             "[-1 Step Drop] Bin ${bin.binIndex}: Shifted ${shiftResult.shiftedCount} frequencies down 1 step " +
@@ -171,10 +239,7 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
 
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(
-                    bins = updatedBins,
-                    oppVoltRows = updatedOppRows
-                ),
+                workspace = updatedWorkspace,
                 netStepDropsByBin = it.netStepDropsByBin + (bin.binIndex to newNetDrops),
                 statusBannerMessage = "Dropped ${shiftResult.shiftedCount} frequencies by 1 voltage step (${sampleFreqMHz}MHz: $beforeLabel → $afterLabel). Bottom 2 unchanged.",
                 isStatusHighlightSuccess = true
@@ -199,8 +264,14 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(levels = shiftResult.updatedRows) else b
         }
+        val updatedWorkspace = state.workspace.copy(
+            bins = updatedBins,
+            oppVoltRows = previousOpp ?: state.workspace.oppVoltRows
+        )
         val currentDrops = state.netStepDropsByBin[bin.binIndex] ?: 0
         val newNetDrops = if (currentDrops > 0) currentDrops - 1 else currentDrops
+
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         appendLog(
             "[+1 Step Up] Bin ${bin.binIndex}: Stepped up ${shiftResult.shiftedCount} frequencies " +
@@ -209,10 +280,7 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
 
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(
-                    bins = updatedBins,
-                    oppVoltRows = previousOpp ?: it.workspace.oppVoltRows
-                ),
+                workspace = updatedWorkspace,
                 netStepDropsByBin = it.netStepDropsByBin + (bin.binIndex to newNetDrops),
                 statusBannerMessage = "Stepped up ${shiftResult.shiftedCount} frequency rows (+1 Step). Bottom 2 unchanged.",
                 isStatusHighlightSuccess = true
@@ -221,7 +289,8 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Resets the active GPU Power Bin (and OPP table) to the exact stock snapshot read on unpack.
+     * Resets the active GPU Power Bin (and OPP table + readVoltageLevels) to the exact untouched
+     * stock snapshot unpacked from the device's DTB, removing any user-added frequencies or levels.
      */
     fun resetActiveBinToStock() {
         val state = _uiState.value
@@ -229,27 +298,82 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         stepHistoryByBin[bin.binIndex]?.clear()
         oppStepHistory.clear()
 
-        val restoredRows = bin.stockLevels.map { it.copy() }
-        val restoredOpp = state.workspace.oppVoltRows.map {
-            it.copy(microvoltOrLevel = it.stockMicrovoltOrLevel)
-        }
+        viewModelScope.launch {
+            val stockDiskText = shellEngine.restoreStockDtsForDtb(state.selectedDtbId)
+            val authoritativeStockText = stockDiskText ?: untouchedStockDts
 
-        val updatedBins = state.workspace.bins.map { b ->
-            if (b.binIndex == bin.binIndex) b.copy(levels = restoredRows) else b
-        }
-
-        appendLog("[Reset] Bin ${bin.binIndex} restored to stock unpacked values.")
-
-        _uiState.update {
-            it.copy(
-                workspace = it.workspace.copy(
+            val restoredWorkspace = if (authoritativeStockText.isNotBlank()) {
+                val freshStockParsed = DtsParser.parseDts(
+                    authoritativeStockText,
+                    state.activePartition,
+                    state.selectedDtbId
+                )
+                val stockBin = freshStockParsed.bins.firstOrNull { it.binIndex == bin.binIndex }
+                if (stockBin != null) {
+                    val updatedBins = state.workspace.bins.map { b ->
+                        if (b.binIndex == bin.binIndex) stockBin else b
+                    }
+                    freshStockParsed.copy(bins = updatedBins)
+                } else {
+                    freshStockParsed
+                }
+            } else {
+                val restoredRows = bin.stockLevels.map { it.copy() }
+                val restoredOpp = state.workspace.oppVoltRows.map {
+                    it.copy(microvoltOrLevel = it.stockMicrovoltOrLevel)
+                }
+                val updatedBins = state.workspace.bins.map { b ->
+                    if (b.binIndex == bin.binIndex) b.copy(levels = restoredRows) else b
+                }
+                val stockCodes = linkedSetOf<Int>()
+                updatedBins.forEach { b -> b.levels.forEach { r -> stockCodes.add(r.voltageLevelCode) } }
+                val cleanReadLevels = stockCodes.sorted().map { code ->
+                    ReadVoltageLevel(
+                        code = code,
+                        label = KnownRpmhLabels.decodeKnownCodeOrRaw(code, state.workspace.chipProfile.chipType),
+                        isFromExistingTable = true
+                    )
+                }
+                state.workspace.copy(
+                    chipProfile = state.workspace.chipProfile.copy(readVoltageLevels = cleanReadLevels),
                     bins = updatedBins,
                     oppVoltRows = restoredOpp
-                ),
-                netStepDropsByBin = it.netStepDropsByBin + (bin.binIndex to 0),
-                statusBannerMessage = "Restored Bin ${bin.binIndex} to stock unpacked table.",
-                isStatusHighlightSuccess = true
-            )
+                )
+            }
+
+            persistWorkspaceToDtsDisk(restoredWorkspace)
+            appendLog("[Reset Stock] Bin ${bin.binIndex} restored to exact stock device DTB values.")
+
+            _uiState.update {
+                it.copy(
+                    workspace = restoredWorkspace,
+                    netStepDropsByBin = it.netStepDropsByBin + (bin.binIndex to 0),
+                    statusBannerMessage = "Restored Bin ${bin.binIndex} to exact stock unpacked table (${restoredWorkspace.bins.firstOrNull { b -> b.binIndex == bin.binIndex }?.levels?.size ?: 0} stock steps).",
+                    isStatusHighlightSuccess = true
+                )
+            }
+        }
+    }
+
+    /**
+     * Explicit "Save GPU Freq Table" action matching original `GpuTableEditor.writeOut(genBack(genTable()))`.
+     */
+    fun saveFreqTableToDts() {
+        val state = _uiState.value
+        val dtsText = DtsParser.serializeToDts(state.workspace)
+        viewModelScope.launch {
+            val saved = shellEngine.writeEditedDtsToDisk(state.selectedDtbId, dtsText)
+            appendLog("[Save Table] Wrote GPU table to ${if (state.selectedDtbId >= 0) "${state.selectedDtbId}.dts" else "workspace"} (${dtsText.lines().size} lines).")
+            _uiState.update {
+                it.copy(
+                    statusBannerMessage = if (saved) {
+                        "Saved GPU frequency table to DTB #${state.selectedDtbId}. Ready for Repack & Flash."
+                    } else {
+                        "Updated GPU frequency table in memory (${dtsText.lines().size} DTS lines)."
+                    },
+                    isStatusHighlightSuccess = true
+                )
+            }
         }
     }
 
@@ -267,7 +391,6 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
 
         val updatedLevels = bin.levels
             .map { if (it.id == updatedRow.id) updatedRow else it }
-            .sortedByDescending { it.frequencyHz }
             .mapIndexed { idx, r -> r.copy(levelIndex = idx) }
 
         val updatedProfile = ensureVoltageCodeRegisteredIfCustom(
@@ -278,16 +401,19 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(levels = updatedLevels) else b
         }
+        val updatedWorkspace = state.workspace.copy(
+            chipProfile = updatedProfile,
+            bins = updatedBins
+        )
+
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         val label = updatedProfile.resolveLabel(updatedRow.voltageLevelCode)
         appendLog("[Edit Row] Updated ${updatedRow.frequencyMHz} MHz -> $label (0x${updatedRow.voltageLevelCode.toString(16)})")
 
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(
-                    chipProfile = updatedProfile,
-                    bins = updatedBins
-                ),
+                workspace = updatedWorkspace,
                 editingFreqRow = null,
                 statusBannerMessage = "Updated ${updatedRow.frequencyMHz} MHz to $label.",
                 isStatusHighlightSuccess = true
@@ -298,26 +424,27 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     fun duplicateFreqRow(row: GpuFreqRow) {
         val state = _uiState.value
         val bin = state.activeBin ?: return
-        if (bin.levels.size >= 24) return
 
+        val currentIdx = bin.levels.indexOfFirst { it.id == row.id }.coerceAtLeast(0)
         val cloned = row.copy(
-            id = UUID.randomUUID().toString(),
-            frequencyHz = row.frequencyHz + 10_000_000L
+            id = UUID.randomUUID().toString()
         )
-        val updatedLevels = (bin.levels + cloned)
-            .sortedByDescending { it.frequencyHz }
-            .mapIndexed { idx, r -> r.copy(levelIndex = idx) }
+        val mutableLevels = bin.levels.toMutableList()
+        mutableLevels.add(currentIdx, cloned)
+        val updatedLevels = mutableLevels.mapIndexed { idx, r -> r.copy(levelIndex = idx) }
 
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(levels = updatedLevels) else b
         }
+        val updatedWorkspace = state.workspace.copy(bins = updatedBins)
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
-        appendLog("[Duplicate] Cloned ${row.frequencyMHz} MHz step as ${cloned.frequencyMHz} MHz.")
+        appendLog("[Duplicate] Cloned ${row.frequencyMHz} MHz step at index $currentIdx.")
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(bins = updatedBins),
+                workspace = updatedWorkspace,
                 editingFreqRow = null,
-                statusBannerMessage = "Duplicated step as ${cloned.frequencyMHz} MHz.",
+                statusBannerMessage = "Duplicated ${cloned.frequencyMHz} MHz step.",
                 isStatusHighlightSuccess = true
             )
         }
@@ -326,11 +453,11 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     fun deleteFreqRow(rowId: String) {
         val state = _uiState.value
         val bin = state.activeBin ?: return
-        if (bin.levels.size <= 3) {
+        if (bin.levels.size <= 2) {
             _uiState.update {
                 it.copy(
                     editingFreqRow = null,
-                    statusBannerMessage = "Cannot delete: a minimum of 3 GPU power levels is required.",
+                    statusBannerMessage = "Cannot delete: at least 2 GPU power levels are required.",
                     isStatusHighlightSuccess = false
                 )
             }
@@ -348,11 +475,13 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
                 b.copy(levels = updatedLevels, initialPwrLevel = safeInitial)
             } else b
         }
+        val updatedWorkspace = state.workspace.copy(bins = updatedBins)
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         appendLog("[Delete] Removed ${target?.frequencyMHz ?: ""} MHz frequency step.")
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(bins = updatedBins),
+                workspace = updatedWorkspace,
                 editingFreqRow = null,
                 statusBannerMessage = "Deleted ${target?.frequencyMHz ?: ""} MHz frequency step.",
                 isStatusHighlightSuccess = true
@@ -378,6 +507,7 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     ) {
         val state = _uiState.value
         val bin = state.activeBin ?: return
+        val templateRawLines = bin.levels.firstOrNull()?.rawLines.orEmpty()
         val newRow = GpuFreqRow(
             id = UUID.randomUUID().toString(),
             levelIndex = 0,
@@ -386,7 +516,8 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
             busFreq = busFreq,
             busMin = busMin,
             busMax = busMax,
-            acdLevelHex = acdHex?.takeIf { it.isNotBlank() }
+            acdLevelHex = acdHex?.takeIf { it.isNotBlank() },
+            rawLines = templateRawLines
         )
         val updatedLevels = (bin.levels + newRow)
             .sortedByDescending { it.frequencyHz }
@@ -400,14 +531,16 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(levels = updatedLevels) else b
         }
+        val updatedWorkspace = state.workspace.copy(
+            chipProfile = updatedProfile,
+            bins = updatedBins
+        )
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         appendLog("[New Step] Added ${frequencyMHz} MHz (${updatedProfile.resolveLabel(voltageLevelCode)}) to Bin ${bin.binIndex}.")
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(
-                    chipProfile = updatedProfile,
-                    bins = updatedBins
-                ),
+                workspace = updatedWorkspace,
                 showNewFreqDialog = false,
                 statusBannerMessage = "Added ${frequencyMHz} MHz step to Bin ${bin.binIndex}.",
                 isStatusHighlightSuccess = true
@@ -422,10 +555,13 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         val updatedBins = state.workspace.bins.map { b ->
             if (b.binIndex == bin.binIndex) b.copy(initialPwrLevel = coerced) else b
         }
+        val updatedWorkspace = state.workspace.copy(bins = updatedBins)
+        persistWorkspaceToDtsDisk(updatedWorkspace)
+
         appendLog("[Bin Param] Set qcom,initial-pwrlevel = $coerced (${bin.levels.getOrNull(coerced)?.frequencyMHz ?: 0} MHz)")
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(bins = updatedBins),
+                workspace = updatedWorkspace,
                 statusBannerMessage = "Updated initial boot power level to index $coerced.",
                 isStatusHighlightSuccess = true
             )
@@ -459,14 +595,16 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         } else {
             state.workspace.chipProfile
         }
+        val updatedWorkspace = state.workspace.copy(
+            chipProfile = updatedProfile,
+            oppVoltRows = updatedOpp
+        )
+        persistWorkspaceToDtsDisk(updatedWorkspace)
 
         appendLog("[Volt Table] Updated OPP ${frequencyHz / 1_000_000L} MHz -> ${updatedProfile.resolveLabel(microvoltOrLevel.toInt())}")
         _uiState.update {
             it.copy(
-                workspace = it.workspace.copy(
-                    chipProfile = updatedProfile,
-                    oppVoltRows = updatedOpp
-                ),
+                workspace = updatedWorkspace,
                 editingOppRow = null,
                 statusBannerMessage = "Updated OPP Voltage Table entry (${frequencyHz / 1_000_000L} MHz).",
                 isStatusHighlightSuccess = true
@@ -475,12 +613,12 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Imports user-provided `.dts` or KonaBess table text and derives the ChipDefinition
-     * strictly from the existing values present in the imported text.
+     * Imports user-provided `.dts` or `konabess://` Gzip+Base64 config text and derives the
+     * ChipDefinition strictly from the existing values present in the imported text.
      */
     fun importDtsOrConfigText(rawText: String, sourceLabel: String = "Imported Config") {
-        val trimmed = rawText.trim()
-        if (trimmed.isEmpty()) {
+        val decodedText = DtsParser.decodeKonaBessUriIfPresent(rawText).trim()
+        if (decodedText.isEmpty()) {
             _uiState.update {
                 it.copy(
                     statusBannerMessage = "Import failed: input text is empty.",
@@ -490,27 +628,42 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
-        val normalizedDts = if (trimmed.contains("qcom,gpu-pwrlevel@") && !trimmed.contains("qcom,gpu-pwrlevels")) {
-            // Wrap bare pwrlevel list into a valid bin
-            """
-            /dts-v1/;
-            / {
-                model = "$sourceLabel";
-                qcom,kgsl-3d0@3d00000 {
-                    qcom,gpu-pwrlevel-bins {
-                        qcom,gpu-pwrlevels-0 {
-                            compatible = "qcom,gpu-pwrlevels";
-                            $trimmed
+        val currentState = _uiState.value
+        val normalizedDts = when {
+            decodedText.contains("qcom,gpu-pwrlevel@") && !decodedText.contains("qcom,gpu-pwrlevels") -> {
+                """
+                /dts-v1/;
+                / {
+                    model = "${currentState.workspace.chipProfile.modelName.ifBlank { sourceLabel }}";
+                    qcom,kgsl-3d0@3d00000 {
+                        qcom,gpu-pwrlevel-bins {
+                            qcom,gpu-pwrlevels-0 {
+                                compatible = "qcom,gpu-pwrlevels";
+                                $decodedText
+                            };
                         };
                     };
                 };
-            };
-            """.trimIndent()
-        } else {
-            trimmed
+                """.trimIndent()
+            }
+            !decodedText.contains("/dts-v1/;") && decodedText.contains("qcom,gpu-pwrlevels") -> {
+                // Bare bin block from konabess:// TableIO export
+                """
+                /dts-v1/;
+                / {
+                    model = "${currentState.workspace.chipProfile.modelName.ifBlank { sourceLabel }}";
+                    qcom,kgsl-3d0@3d00000 {
+                        qcom,gpu-pwrlevel-bins {
+                            $decodedText
+                        };
+                    };
+                };
+                """.trimIndent()
+            }
+            else -> decodedText
         }
 
-        val parsed = DtsParser.parseDts(normalizedDts, sourceLabel)
+        val parsed = DtsParser.parseDts(normalizedDts, sourceLabel, currentState.selectedDtbId)
         if (parsed.bins.isEmpty()) {
             _uiState.update {
                 it.copy(
@@ -521,18 +674,45 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
             return
         }
 
+        // If we already have an unpacked full DTB in memory and the user imported a konabess:// bin snippet,
+        // preserve the unpacked DTB's surrounding lines and splice point (matching TableIO in KonaBess)!
+        val finalWorkspace = if (!decodedText.contains("/dts-v1/;") &&
+            currentState.workspace.originalDtsLinesConsideringSplice.isNotEmpty() &&
+            currentState.workspace.binSplicePosition >= 0
+        ) {
+            val stockBins = currentState.workspace.bins
+            val binsWithStockPreserved = parsed.bins.map { importedBin ->
+                val origStock = stockBins.firstOrNull { it.binIndex == importedBin.binIndex }?.stockLevels
+                if (origStock != null) importedBin.copy(stockLevels = origStock) else importedBin
+            }
+            currentState.workspace.copy(
+                chipProfile = currentState.workspace.chipProfile.copy(
+                    readVoltageLevels = parsed.chipProfile.readVoltageLevels
+                ),
+                bins = binsWithStockPreserved,
+                oppVoltRows = if (parsed.oppVoltRows.isNotEmpty()) parsed.oppVoltRows else currentState.workspace.oppVoltRows
+            )
+        } else {
+            if (untouchedStockDts.isBlank()) {
+                untouchedStockDts = normalizedDts
+            }
+            parsed
+        }
+
         stepHistoryByBin.clear()
         oppStepHistory.clear()
-        val readLevelsText = parsed.chipProfile.readVoltageLevels.joinToString(", ") { it.label }
-        appendLog("[Import] Loaded ${parsed.bins.size} bin(s) from $sourceLabel. Existing voltage levels: $readLevelsText")
+        persistWorkspaceToDtsDisk(finalWorkspace)
+
+        val readLevelsText = finalWorkspace.chipProfile.readVoltageLevels.joinToString(", ") { it.label }
+        appendLog("[Import] Loaded ${finalWorkspace.bins.size} bin(s) from $sourceLabel. Voltage levels: $readLevelsText")
 
         _uiState.update {
             it.copy(
-                workspace = parsed,
-                selectedBinIndex = parsed.bins.first().binIndex,
+                workspace = finalWorkspace,
+                selectedBinIndex = finalWorkspace.bins.first().binIndex,
                 selectedTab = KonaBessTab.FREQ_TABLE,
                 netStepDropsByBin = emptyMap(),
-                statusBannerMessage = "Imported ${parsed.bins.size} bin(s). Derived ${parsed.chipProfile.readVoltageLevels.size} existing voltage levels.",
+                statusBannerMessage = "Imported ${finalWorkspace.bins.size} bin(s) (${finalWorkspace.bins.first().levels.size} steps).",
                 isStatusHighlightSuccess = true
             )
         }
@@ -543,18 +723,22 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         return DtsParser.exportKonaBessConfig(state.workspace, state.selectedBinIndex)
     }
 
+    fun exportKonaBessClipboardUri(): String {
+        return DtsParser.exportKonaBessUri(_uiState.value.workspace)
+    }
+
     fun exportFullDtsText(): String {
         return DtsParser.serializeToDts(_uiState.value.workspace)
     }
 
     fun backupOldImage() {
         viewModelScope.launch {
-            val (_, message) = shellEngine.createBackupImageCopy()
+            val (ok, message) = shellEngine.createBackupImageCopy()
             appendLog("[Backup] $message")
             _uiState.update {
                 it.copy(
                     statusBannerMessage = message,
-                    isStatusHighlightSuccess = true
+                    isStatusHighlightSuccess = ok
                 )
             }
         }
@@ -563,13 +747,18 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     fun repackAndFlashImage() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
-            val dtsText = DtsParser.serializeToDts(_uiState.value.workspace)
-            val result = shellEngine.saveRepackedDtsAndFlash(dtsText)
-            _uiState.update { state ->
-                state.copy(
+            val state = _uiState.value
+            val dtsText = DtsParser.serializeToDts(state.workspace)
+            val result = shellEngine.saveRepackedDtsAndFlash(state.selectedDtbId, dtsText)
+            _uiState.update { current ->
+                current.copy(
                     isLoading = false,
-                    shellLogs = state.shellLogs + result.logs,
-                    statusBannerMessage = "Repacked modified DTS (${dtsText.lines().size} lines) and wrote image output.",
+                    shellLogs = current.shellLogs + result.logs,
+                    statusBannerMessage = if (result.success && result.hasRootAccess) {
+                        "Successfully repacked & flashed ${result.bootName} image!"
+                    } else {
+                        result.logs.lastOrNull() ?: "Repack operation completed."
+                    },
                     isStatusHighlightSuccess = result.success
                 )
             }
@@ -580,14 +769,23 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(statusBannerMessage = null) }
     }
 
+    private fun persistWorkspaceToDtsDisk(workspace: ParsedDtsWorkspace) {
+        val dtbId = _uiState.value.selectedDtbId
+        if (dtbId < 0) return
+        val dtsText = DtsParser.serializeToDts(workspace)
+        viewModelScope.launch {
+            shellEngine.writeEditedDtsToDisk(dtbId, dtsText)
+        }
+    }
+
     private fun ensureVoltageCodeRegisteredIfCustom(
-        profile: com.example.konabess.model.DynamicChipProfile,
+        profile: DynamicChipProfile,
         code: Int
-    ): com.example.konabess.model.DynamicChipProfile {
+    ): DynamicChipProfile {
         if (profile.readVoltageLevels.any { it.code == code }) return profile
         val updatedLevels = (profile.readVoltageLevels + ReadVoltageLevel(
             code = code,
-            label = KnownRpmhLabels.decodeKnownCodeOrRaw(code),
+            label = KnownRpmhLabels.decodeKnownCodeOrRaw(code, profile.chipType),
             isFromExistingTable = false
         )).sortedBy { it.code }
         return profile.copy(readVoltageLevels = updatedLevels)
