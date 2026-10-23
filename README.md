@@ -10,7 +10,7 @@ The compiled, signed installable APK is tracked directly in this repository unde
 
 | Artifact | Path | Application ID | Size | SHA-256 Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **SageKonaBess v1.0 APK** | [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) | `com.aistudio.sagekonabess.rxvq` | ~18.0 MB | `ad71433440cc8c7bbc503591a6098fd8ad02f6644217c142bb6bc4933f3bec22` |
+| **SageKonaBess v1.0 APK** | [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) | `com.aistudio.sagekonabess.rxvq` | ~18.0 MB | `d45dd32ef369da404c11111d1adc4f0a06c062e75dae60025535a20d1363c946` |
 
 ### Quick Installation
 ```bash

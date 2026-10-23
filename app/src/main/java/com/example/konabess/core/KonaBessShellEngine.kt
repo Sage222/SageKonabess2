@@ -613,11 +613,20 @@ class KonaBessShellEngine(private val context: Context) {
 
     /**
      * Exact port of `KonaBessCore.checkDevice()`:
-     * Checks each decompiled `0.dts .. (dtbNum - 1).dts` for GPU power level tables and chip model.
+     * Checks each decompiled `0.dts .. (dtbNum - 1).dts` using strict `model` line matching
+     * (`detectChipTypeStrict`), identical to `libxzr/KonaBess`.
+     *
+     * On devices like Snapdragon 8 Gen 2 (`Kalama`), `vendor_boot` contains 4 DTBs (`0.dtb` = Kalama,
+     * `1.dtb` = Kalama v2, `2.dtb` = Kalama IOT, `3.dtb` = Kalama HHG). `detectChipTypeStrict` matches
+     * ONLY `1.dtb` (`Kalama v2`), so `matched.size == 1` and only the exact DTB exposed by original
+     * KonaBess is returned. If multiple DTBs match and one is the active boot DTB (`ro.boot.dtb_idx`
+     * or `/proc/device-tree/model`), only that active DTB is exposed.
      */
     private fun checkDeviceDtbs(logs: MutableList<String>): List<DetectedDtb> {
         val bootDtbIdx = getDtbIndexProperty()
-        val matched = mutableListOf<DetectedDtb>()
+        val liveModel = getLiveDeviceTreeModel()
+        val deviceName = Build.DEVICE.orEmpty()
+        val strictMatched = mutableListOf<DetectedDtb>()
 
         for (i in 0 until dtbNum) {
             val dtsFile = File(filesDir, "$i.dts")
@@ -629,22 +638,64 @@ class KonaBessShellEngine(private val context: Context) {
             }
             if (!hasGpuPwrlevels) continue
 
-            val (chipType, modelDesc) = DtsParser.detectChipType(lines)
+            val (chipType, modelDesc) = DtsParser.detectChipTypeStrict(lines, deviceName)
             if (chipType != KonaBessChipType.unknown) {
-                matched.add(
+                val isBootMatch = (i == bootDtbIdx) ||
+                    (liveModel.isNotBlank() && modelDesc.isNotBlank() && liveModel.contains(modelDesc))
+                strictMatched.add(
                     DetectedDtb(
                         id = i,
                         chipType = chipType,
                         description = modelDesc.ifBlank { chipType.name },
-                        isActiveBootDtb = (i == bootDtbIdx)
+                        isActiveBootDtb = isBootMatch
                     )
                 )
             }
         }
-        if (matched.size == 1 && !matched[0].isActiveBootDtb) {
-            matched[0] = matched[0].copy(isActiveBootDtb = true)
+
+        // Fallback only if no DTB matched strict model strings (e.g., custom OEM model string)
+        val candidates = if (strictMatched.isNotEmpty()) {
+            strictMatched
+        } else {
+            val fallbackList = mutableListOf<DetectedDtb>()
+            for (i in 0 until dtbNum) {
+                val dtsFile = File(filesDir, "$i.dts")
+                if (!dtsFile.exists()) continue
+                val lines = dtsFile.readLines()
+                val hasGpuPwrlevels = lines.any {
+                    val t = it.trim()
+                    t.startsWith("qcom,gpu-pwrlevels {") || t.startsWith("qcom,gpu-pwrlevels-")
+                }
+                if (!hasGpuPwrlevels) continue
+                val (chipType, modelDesc) = DtsParser.detectChipType(lines)
+                if (chipType != KonaBessChipType.unknown) {
+                    val isBootMatch = (i == bootDtbIdx) ||
+                        (liveModel.isNotBlank() && modelDesc.isNotBlank() && liveModel.contains(modelDesc))
+                    fallbackList.add(
+                        DetectedDtb(
+                            id = i,
+                            chipType = chipType,
+                            description = modelDesc.ifBlank { chipType.name },
+                            isActiveBootDtb = isBootMatch
+                        )
+                    )
+                }
+            }
+            fallbackList
         }
-        return matched
+
+        // If multiple DTBs matched but one is explicitly the active boot DTB, expose only that active DTB
+        val activeOnly = candidates.filter { it.isActiveBootDtb }
+        val finalMatched = if (activeOnly.size == 1) {
+            activeOnly
+        } else {
+            candidates
+        }
+
+        if (finalMatched.size == 1 && !finalMatched[0].isActiveBootDtb) {
+            return listOf(finalMatched[0].copy(isActiveBootDtb = true))
+        }
+        return finalMatched
     }
 
     private fun checkRootAccess(): Boolean {
@@ -660,6 +711,11 @@ class KonaBessShellEngine(private val context: Context) {
     private fun getDtbIndexProperty(): Int {
         val (_, out) = execShell("getprop ro.boot.dtb_idx", useRoot = true)
         return out.lineSequence().firstOrNull().orEmpty().trim().toIntOrNull() ?: -1
+    }
+
+    private fun getLiveDeviceTreeModel(): String {
+        val (_, out) = execShell("tr -d '\\0' < /proc/device-tree/model", useRoot = true)
+        return out.lineSequence().firstOrNull().orEmpty().trim()
     }
 
     private fun execShell(command: String, useRoot: Boolean): Pair<Int, String> {

@@ -74,7 +74,7 @@ fun EditFreqRowDialog(
     var freqMhzText by remember(row.id) { mutableStateOf(row.frequencyMHz.toString()) }
     var selectedVoltageCode by remember(row.id) { mutableIntStateOf(row.voltageLevelCode) }
     var customVoltageCodeText by remember(row.id) { mutableStateOf("") }
-    var showAllChipLevels by remember(row.id) { mutableStateOf(false) }
+    var showAllChipLevels by remember(row.id) { mutableStateOf(true) }
     var busFreqText by remember(row.id) { mutableStateOf(row.busFreq.toString()) }
     var busMinText by remember(row.id) { mutableStateOf(row.busMin.toString()) }
     var busMaxText by remember(row.id) { mutableStateOf(row.busMax.toString()) }
@@ -347,7 +347,7 @@ fun NewFreqRowDialog(
     val defaultCode = chipProfile.readVoltageLevels.lastOrNull()?.code ?: 192
     var freqMhzText by remember { mutableStateOf("750") }
     var selectedVoltageCode by remember { mutableIntStateOf(defaultCode) }
-    var showAllChipLevels by remember { mutableStateOf(false) }
+    var showAllChipLevels by remember { mutableStateOf(true) }
     var busFreqText by remember { mutableStateOf("8") }
     var busMinText by remember { mutableStateOf("6") }
     var busMaxText by remember { mutableStateOf("10") }

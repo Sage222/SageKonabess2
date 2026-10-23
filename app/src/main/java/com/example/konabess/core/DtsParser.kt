@@ -33,14 +33,102 @@ import java.util.zip.GZIPOutputStream
 object DtsParser {
 
     /**
-     * Detects the chip type from a decompiled `.dts` file using the exact matching rules from
-     * `libxzr/KonaBess` `KonaBessCore.checkDevice()`.
+     * Exact port of `KonaBessCore.checkDevice()` + `KonaBessCore.checkChip()` from `libxzr/KonaBess`.
+     *
+     * CRITICAL: Upstream KonaBess ONLY matches DTBs whose `model = "...";` line contains the exact
+     * production SoC model string (e.g., `"Kalama v2"` or `"KalamaP v2"`, NOT `"Kalama"`,
+     * `"Kalama IOT"`, or `"Kalama HHG"`). This ensures that on multi-DTB vendor_boot images
+     * (like Snapdragon 8 Gen 2 which packs 4 DTBs: Kalama, Kalama v2, Kalama IOT, Kalama HHG),
+     * ONLY the single production DTB (`Kalama v2`) is matched and exposed—identical to original KonaBess.
      */
-    fun detectChipType(lines: List<String>): Pair<KonaBessChipType, String> {
+    fun detectChipTypeStrict(lines: List<String>, deviceName: String = ""): Pair<KonaBessChipType, String> {
+        var modelLine = ""
         var modelDesc = ""
+        var hasSingleBinNode = false
+        var hasMultiBinNode = false
+
+        for (raw in lines) {
+            val line = raw.trim()
+            if (line.startsWith("model =") && modelLine.isEmpty()) {
+                modelLine = line
+                modelDesc = line.substringAfter("=").removeSuffix(";").trim().removeSurrounding("\"")
+            } else if (line.startsWith("qcom,gpu-pwrlevels {")) {
+                hasSingleBinNode = true
+            } else if (line.startsWith("qcom,gpu-pwrlevels-")) {
+                hasMultiBinNode = true
+            }
+        }
+
+        val isSingleBin = hasSingleBinNode && !hasMultiBinNode
+        fun checkChip(chip: String): Boolean = modelLine.contains(chip)
+
+        val detectedType = when {
+            checkChip("kona v2.1") ->
+                if (deviceName != "OP4E5D") KonaBessChipType.kona else KonaBessChipType.kona_singleBin
+            checkChip("SM8150 v2") ->
+                if (isSingleBin) KonaBessChipType.msmnile_singleBin else KonaBessChipType.msmnile
+            checkChip("Lahaina V2.1") || checkChip("Lahaina v2.1") ->
+                if (isSingleBin) KonaBessChipType.lahaina_singleBin else KonaBessChipType.lahaina
+            checkChip("Lito v2") || checkChip("Lito") ->
+                if (checkChip("v2")) KonaBessChipType.lito_v2 else KonaBessChipType.lito_v1
+            checkChip("Lagoon") ->
+                KonaBessChipType.lagoon
+            checkChip("Shima") ->
+                KonaBessChipType.shima
+            checkChip("Yupik") ->
+                KonaBessChipType.yupik
+            checkChip("Waipio") || checkChip("Waipio v2") ->
+                KonaBessChipType.waipio_singleBin
+            checkChip("Cape") ->
+                KonaBessChipType.cape_singleBin
+            checkChip("KalamaP SG SoC") ->
+                KonaBessChipType.kalama_sg_singleBin
+            checkChip("Kalama v2") || checkChip("KalamaP v2") ->
+                KonaBessChipType.kalama
+            checkChip("Diwali") ->
+                KonaBessChipType.diwali
+            checkChip("Ukee") ->
+                KonaBessChipType.ukee_singleBin
+            checkChip("Pineapple v2") || checkChip("PineappleP v2") ->
+                KonaBessChipType.pineapple
+            checkChip("Cliffs SoC") ->
+                KonaBessChipType.cliffs_singleBin
+            checkChip("Cliffs 7 SoC") ->
+                KonaBessChipType.cliffs_7_singleBin
+            checkChip("Sun v2 SoC") ||
+                checkChip("Sun Alt. Thermal Profile v2 SoC") ||
+                checkChip("SunP v2 SoC") ||
+                checkChip("SunP v2 Alt. Thermal Profile SoC") ->
+                KonaBessChipType.sun
+            checkChip("Canoe v2 SoC") || checkChip("CanoeP v2 SoC") ->
+                KonaBessChipType.canoe
+            else ->
+                KonaBessChipType.unknown
+        }
+
+        return Pair(detectedType, modelDesc)
+    }
+
+    /**
+     * Detects the chip type from a decompiled `.dts` file or imported `konabess://` snippet.
+     * First applies the strict `KonaBessCore.checkDevice()` model check; if importing a snippet
+     * that lacks the full `model` string, falls back to `compatible`, `fallbackChipType`, or
+     * RPMh level signature detection.
+     */
+    fun detectChipType(
+        lines: List<String>,
+        fallbackChipType: KonaBessChipType = KonaBessChipType.unknown
+    ): Pair<KonaBessChipType, String> {
+        val (strictType, strictModel) = detectChipTypeStrict(lines)
+        if (strictType != KonaBessChipType.unknown) {
+            return Pair(strictType, strictModel)
+        }
+
+        var modelDesc = strictModel
         var compatibleLine = ""
         var hasSingleBinNode = false
         var hasMultiBinNode = false
+        var hasKalamaD2OrD0Level = false
 
         for (raw in lines) {
             val line = raw.trim()
@@ -52,6 +140,11 @@ object DtsParser {
                 hasSingleBinNode = true
             } else if (line.startsWith("qcom,gpu-pwrlevels-")) {
                 hasMultiBinNode = true
+            } else if (line.startsWith("qcom,level =") || line.startsWith("qcom,cx-level =")) {
+                val code = decodeIntLine(line).toInt()
+                if (code == 52 || code == 60 || code == 72) {
+                    hasKalamaD2OrD0Level = true
+                }
             }
         }
 
@@ -65,36 +158,42 @@ object DtsParser {
                 KonaBessChipType.cliffs_7_singleBin
             compatibleLine.contains("qcom,cliffs") ->
                 KonaBessChipType.cliffs_singleBin
-            compatibleLine.contains("qcom,pineapple") ->
+            compatibleLine.contains("qcom,pineapple") || combined.contains("Pineapple", ignoreCase = true) ->
                 KonaBessChipType.pineapple
-            compatibleLine.contains("qcom,ukee") ->
+            compatibleLine.contains("qcom,ukee") || combined.contains("Ukee", ignoreCase = true) ->
                 KonaBessChipType.ukee_singleBin
-            compatibleLine.contains("qcom,diwali") ->
+            compatibleLine.contains("qcom,diwali") || combined.contains("Diwali", ignoreCase = true) ->
                 KonaBessChipType.diwali
-            compatibleLine.contains("qcom,kalama") && (modelDesc.contains("SG") || hasSingleBinNode) ->
+            (compatibleLine.contains("qcom,kalama") || combined.contains("Kalama", ignoreCase = true)) &&
+                (modelDesc.contains("SG") || (hasSingleBinNode && !hasMultiBinNode)) ->
                 KonaBessChipType.kalama_sg_singleBin
-            compatibleLine.contains("qcom,kalama") ->
+            compatibleLine.contains("qcom,kalama") || combined.contains("Kalama", ignoreCase = true) ->
                 KonaBessChipType.kalama
-            compatibleLine.contains("qcom,cape") ->
+            compatibleLine.contains("qcom,cape") || combined.contains("Cape", ignoreCase = true) ->
                 KonaBessChipType.cape_singleBin
-            compatibleLine.contains("qcom,waipio") ->
+            compatibleLine.contains("qcom,waipio") || combined.contains("Waipio", ignoreCase = true) ->
                 KonaBessChipType.waipio_singleBin
-            compatibleLine.contains("qcom,yupik") ->
+            compatibleLine.contains("qcom,yupik") || combined.contains("Yupik", ignoreCase = true) ->
                 KonaBessChipType.yupik
-            compatibleLine.contains("qcom,shima") ->
+            compatibleLine.contains("qcom,shima") || combined.contains("Shima", ignoreCase = true) ->
                 KonaBessChipType.shima
-            compatibleLine.contains("qcom,lagoon") ->
+            compatibleLine.contains("qcom,lagoon") || combined.contains("Lagoon", ignoreCase = true) ->
                 KonaBessChipType.lagoon
-            compatibleLine.contains("qcom,lito") && modelDesc.contains("v2", ignoreCase = true) ->
+            (compatibleLine.contains("qcom,lito") || combined.contains("Lito", ignoreCase = true)) &&
+                modelDesc.contains("v2", ignoreCase = true) ->
                 KonaBessChipType.lito_v2
-            compatibleLine.contains("qcom,lito") ->
+            compatibleLine.contains("qcom,lito") || combined.contains("Lito", ignoreCase = true) ->
                 KonaBessChipType.lito_v1
-            compatibleLine.contains("qcom,lahaina") ->
+            compatibleLine.contains("qcom,lahaina") || combined.contains("Lahaina", ignoreCase = true) ->
                 if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.lahaina_singleBin else KonaBessChipType.lahaina
-            compatibleLine.contains("qcom,kona") || compatibleLine.contains("qcom,sm8250") ->
+            compatibleLine.contains("qcom,kona") || compatibleLine.contains("qcom,sm8250") || combined.contains("Kona", ignoreCase = true) ->
                 if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.kona_singleBin else KonaBessChipType.kona
-            compatibleLine.contains("qcom,msmnile") || compatibleLine.contains("qcom,sm8150") ->
+            compatibleLine.contains("qcom,msmnile") || compatibleLine.contains("qcom,sm8150") || combined.contains("SM8150", ignoreCase = true) ->
                 if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.msmnile_singleBin else KonaBessChipType.msmnile
+            fallbackChipType != KonaBessChipType.unknown ->
+                fallbackChipType
+            hasKalamaD2OrD0Level ->
+                if (hasSingleBinNode && !hasMultiBinNode) KonaBessChipType.kalama_sg_singleBin else KonaBessChipType.kalama
             hasSingleBinNode && !hasMultiBinNode ->
                 KonaBessChipType.kona_singleBin
             hasMultiBinNode ->
@@ -109,7 +208,8 @@ object DtsParser {
     fun parseDts(
         dtsContent: String,
         sourcePartition: String = "vendor_boot / boot",
-        activeDtbId: Int = -1
+        activeDtbId: Int = -1,
+        fallbackChipType: KonaBessChipType = KonaBessChipType.unknown
     ): ParsedDtsWorkspace {
         if (dtsContent.isBlank()) {
             val emptyProfile = DynamicChipProfile(
@@ -133,7 +233,7 @@ object DtsParser {
         }
 
         val allLines = dtsContent.lines()
-        val (chipType, detectedModelDesc) = detectChipType(allLines)
+        val (chipType, detectedModelDesc) = detectChipType(allLines, fallbackChipType)
 
         var modelName = detectedModelDesc
         val compatibleTokens = mutableListOf<String>()
@@ -150,6 +250,8 @@ object DtsParser {
                 msmIdHex = decodeHexLine(line)
             } else if (line.startsWith("qcom,cx-ipeak =")) {
                 detectedLevelKey = "qcom,cx-ipeak"
+            } else if (line.startsWith("qcom,cx-level =")) {
+                detectedLevelKey = "qcom,cx-level"
             } else if (line.startsWith("qcom,level =")) {
                 detectedLevelKey = "qcom,level"
             }
@@ -317,7 +419,7 @@ object DtsParser {
                             val rawVal = prop.substringAfter("=").substringBefore(";").trim()
                             when (key) {
                                 "qcom,gpu-freq" -> { /* already parsed */ }
-                                "qcom,level", "qcom,cx-ipeak" -> voltCode = decodeIntLine(prop).toInt()
+                                "qcom,level", "qcom,cx-level", "qcom,cx-ipeak" -> voltCode = decodeIntLine(prop).toInt()
                                 "qcom,bus-freq" -> busFreq = decodeIntLine(prop).toInt()
                                 "qcom,bus-min" -> busMin = decodeIntLine(prop).toInt()
                                 "qcom,bus-max" -> busMax = decodeIntLine(prop).toInt()
@@ -504,7 +606,7 @@ object DtsParser {
                                 lines.add("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
                                 wroteFreq = true
                             }
-                            "qcom,level", "qcom,cx-ipeak" -> {
+                            "qcom,level", "qcom,cx-level", "qcom,cx-ipeak" -> {
                                 lines.add("        $key = <0x${row.voltageLevelCode.toString(16)}>;")
                                 wroteLevel = true
                             }

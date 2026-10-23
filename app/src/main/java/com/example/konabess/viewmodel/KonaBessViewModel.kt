@@ -82,7 +82,7 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     val uiState: StateFlow<KonaBessUiState> = _uiState.asStateFlow()
 
     init {
-        unpackDeviceImage(forceReloadStock = false)
+        unpackDeviceImage(forceReloadStock = true)
     }
 
     fun unpackDeviceImage(forceReloadStock: Boolean = false, preferredDtbId: Int? = null) {
@@ -125,7 +125,8 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
                 val currentParsed = DtsParser.parseDts(
                     result.dtsContent,
                     result.activePartition,
-                    result.selectedDtbId
+                    result.selectedDtbId,
+                    stockParsed.chipProfile.chipType
                 )
                 // Always attach the authentic untouched stockLevels from .dts.stock
                 val mergedBins = currentParsed.bins.map { bin ->
@@ -136,7 +137,21 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
                         bin
                     }
                 }
-                currentParsed.copy(bins = mergedBins)
+                // Merge stock voltage levels with current voltage levels so stock levels like LOW_SVS_D0 never disappear
+                val mergedCodes = (stockParsed.chipProfile.readVoltageLevels.map { it.code } +
+                    currentParsed.chipProfile.readVoltageLevels.map { it.code }).toSortedSet()
+                val stockCodeSet = stockParsed.chipProfile.readVoltageLevels.map { it.code }.toSet()
+                val mergedReadLevels = mergedCodes.map { code ->
+                    ReadVoltageLevel(
+                        code = code,
+                        label = KnownRpmhLabels.decodeKnownCodeOrRaw(code, stockParsed.chipProfile.chipType),
+                        isFromExistingTable = code in stockCodeSet
+                    )
+                }
+                currentParsed.copy(
+                    chipProfile = currentParsed.chipProfile.copy(readVoltageLevels = mergedReadLevels),
+                    bins = mergedBins
+                )
             }
 
             stepHistoryByBin.clear()
@@ -663,7 +678,12 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
             else -> decodedText
         }
 
-        val parsed = DtsParser.parseDts(normalizedDts, sourceLabel, currentState.selectedDtbId)
+        val parsed = DtsParser.parseDts(
+            normalizedDts,
+            sourceLabel,
+            currentState.selectedDtbId,
+            currentState.workspace.chipProfile.chipType
+        )
         if (parsed.bins.isEmpty()) {
             _uiState.update {
                 it.copy(
@@ -685,9 +705,18 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
                 val origStock = stockBins.firstOrNull { it.binIndex == importedBin.binIndex }?.stockLevels
                 if (origStock != null) importedBin.copy(stockLevels = origStock) else importedBin
             }
+            val mergedCodes = (currentState.workspace.chipProfile.readVoltageLevels.map { it.code } +
+                parsed.chipProfile.readVoltageLevels.map { it.code }).toSortedSet()
+            val mergedReadLevels = mergedCodes.map { code ->
+                ReadVoltageLevel(
+                    code = code,
+                    label = KnownRpmhLabels.decodeKnownCodeOrRaw(code, currentState.workspace.chipProfile.chipType),
+                    isFromExistingTable = true
+                )
+            }
             currentState.workspace.copy(
                 chipProfile = currentState.workspace.chipProfile.copy(
-                    readVoltageLevels = parsed.chipProfile.readVoltageLevels
+                    readVoltageLevels = mergedReadLevels
                 ),
                 bins = binsWithStockPreserved,
                 oppVoltRows = if (parsed.oppVoltRows.isNotEmpty()) parsed.oppVoltRows else currentState.workspace.oppVoltRows

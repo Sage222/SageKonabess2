@@ -14,7 +14,7 @@ enum class KonaBessChipType(val isSingleBin: Boolean, val voltTableIgnore: Boole
     lito_v2(isSingleBin = false, voltTableIgnore = false),
     lagoon(isSingleBin = false, voltTableIgnore = false),
     shima(isSingleBin = false, voltTableIgnore = true),
-    yupik(isSingleBin = true, voltTableIgnore = true),
+    yupik(isSingleBin = false, voltTableIgnore = true),
     waipio_singleBin(isSingleBin = true, voltTableIgnore = true),
     cape_singleBin(isSingleBin = true, voltTableIgnore = true),
     kalama(isSingleBin = false, voltTableIgnore = true),
@@ -74,9 +74,10 @@ data class DynamicChipProfile(
     val activeDtbId: Int = -1
 ) {
     fun resolveLabel(code: Int): String {
+        val decoded = KnownRpmhLabels.decodeKnownCodeOrRaw(code, chipType)
+        if (!decoded.contains("LEVEL_")) return decoded
         val found = readVoltageLevels.firstOrNull { it.code == code }
-        if (found != null) return found.label
-        return KnownRpmhLabels.decodeKnownCodeOrRaw(code, chipType)
+        return found?.label ?: decoded
     }
 
     fun resolveDisplayWithCode(code: Int): String {
@@ -90,19 +91,20 @@ data class DynamicChipProfile(
 
     /**
      * Full hardware RPMh map for this chip family (from original ChipInfo.rpmh_levels),
-     * exposed ONLY if the user explicitly requests to add a non-stock level manually.
+     * matching the exact Spinner options in GpuTableEditor.generateALevel().
      */
     val chipFamilyManualLevels: List<ReadVoltageLevel>
-        get() = KnownRpmhLabels.getManualLevelsForChip(chipType)
+        get() {
+            val existingCodes = readVoltageLevels.map { it.code }.toSet()
+            return KnownRpmhLabels.getManualLevelsForChip(chipType).map { lvl ->
+                lvl.copy(isFromExistingTable = lvl.code in existingCodes)
+            }
+        }
 }
 
 /**
  * Exact Qualcomm RPMh integer-to-name lookup from libxzr/KonaBess ChipInfo.rpmh_levels
  * and KonaBessStr.convert_bins.
- *
- * Used to translate integer codes that are actually encountered in the device's unpacked DTS
- * into human-readable labels (e.g. 192 -> SVS_L1, 224 -> SVS_L2). Never used to inject
- * unreferenced bins into a device's default table.
  */
 object KnownRpmhLabels {
 
@@ -111,17 +113,69 @@ object KnownRpmhLabels {
         val labels: Array<String>
     )
 
-    private val standardRpmh = LevelTable(
+    // Exact rpmh_levels_kona / lahaina_singleBin / lito / lagoon / shima / yupik / waipio / cape / diwali / ukee
+    private val konaAndWaipioRpmh = LevelTable(
         levels = intArrayOf(
-            16, 32, 48, 56, 60, 64, 80, 96,
-            128, 144, 192, 224, 256, 320, 336, 352,
-            384, 392, 400, 416, 432, 448, 464, 480, 496, 512
+            16, 48, 56, 64, 80, 96, 128, 144, 192, 224, 256, 320,
+            336, 352, 384, 400, 416
         ),
         labels = arrayOf(
             "RETENTION",
-            "MIN_SVS_D1",
             "MIN_SVS",
-            "LOW_SVS_D2",
+            "LOW_SVS_D1",
+            "LOW_SVS",
+            "LOW_SVS_L1",
+            "LOW_SVS_L2",
+            "SVS",
+            "SVS_L0",
+            "SVS_L1",
+            "SVS_L2",
+            "NOM",
+            "NOM_L1",
+            "NOM_L2",
+            "NOM_L3",
+            "TURBO",
+            "TURBO_L0",
+            "TURBO_L1"
+        )
+    )
+
+    // Exact rpmh_levels_msmnile (RPMH_REGULATOR_LEVEL_OFFSET = 1)
+    private val msmnileRpmh = LevelTable(
+        levels = intArrayOf(
+            17, 49, 57, 65, 81, 97, 129, 145, 193, 225, 257, 321,
+            337, 353, 385, 401, 417
+        ),
+        labels = arrayOf(
+            "RETENTION",
+            "MIN_SVS",
+            "LOW_SVS_D1",
+            "LOW_SVS",
+            "LOW_SVS_L1",
+            "LOW_SVS_L2",
+            "SVS",
+            "SVS_L0",
+            "SVS_L1",
+            "SVS_L2",
+            "NOM",
+            "NOM_L1",
+            "NOM_L2",
+            "NOM_L3",
+            "TURBO",
+            "TURBO_L0",
+            "TURBO_L1"
+        )
+    )
+
+    // Exact rpmh_levels_lahaina
+    private val lahainaRpmh = LevelTable(
+        levels = intArrayOf(
+            16, 48, 56, 64, 80, 96, 128, 144, 192, 224, 256, 320,
+            336, 352, 384, 400, 416, 432, 448, 464
+        ),
+        labels = arrayOf(
+            "RETENTION",
+            "MIN_SVS",
             "LOW_SVS_D1",
             "LOW_SVS",
             "LOW_SVS_L1",
@@ -138,61 +192,148 @@ object KnownRpmhLabels {
             "TURBO_L0",
             "TURBO_L1",
             "TURBO_L2",
-            "TURBO_L3",
             "SUPER_TURBO",
-            "SUPER_TURBO_NO_CPR",
-            "SUPER_TURBO_L1",
-            "SUPER_TURBO_L2",
-            "SUPER_TURBO_L3"
+            "SUPER_TURBO_NO_CPR"
         )
     )
 
-    private val litoV1AndLagoonRpmh = LevelTable(
-        levels = intArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+    // Exact rpmh_levels_kalama / rpmh_levels_pineapple / rpmh_levels_cliffs
+    private val kalamaAndPineappleRpmh = LevelTable(
+        levels = intArrayOf(
+            16, 48, 52, 56, 60, 64, 72, 80, 96, 128, 144, 192,
+            224, 256, 288, 320, 336, 384, 400, 416, 432, 448, 464, 480
+        ),
         labels = arrayOf(
+            "RETENTION",
             "MIN_SVS",
+            "LOW_SVS_D2",
+            "LOW_SVS_D1",
+            "LOW_SVS_D0",
             "LOW_SVS",
+            "LOW_SVS_P1",
             "LOW_SVS_L1",
             "LOW_SVS_L2",
             "SVS",
+            "SVS_L0",
             "SVS_L1",
             "SVS_L2",
             "NOM",
+            "NOM_L0",
             "NOM_L1",
             "NOM_L2",
-            "NOM_L3",
-            "TURBO"
+            "TURBO",
+            "TURBO_L0",
+            "TURBO_L1",
+            "TURBO_L2",
+            "TURBO_L3",
+            "SUPER_TURBO",
+            "SUPER_TURBO_NO_CPR"
         )
     )
 
-    private val msmnileRpmh = LevelTable(
-        levels = intArrayOf(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+    // Exact rpmh_levels_sun
+    private val sunRpmh = LevelTable(
+        levels = intArrayOf(
+            16, 48, 50, 52, 56, 60, 64, 72, 80, 96, 128, 144, 192,
+            224, 256, 288, 320, 336, 384, 400, 416, 432, 448, 452, 464, 480
+        ),
         labels = arrayOf(
-            "OFF",
             "RETENTION",
             "MIN_SVS",
+            "LOW_SVS_D3",
+            "LOW_SVS_D2",
+            "LOW_SVS_D1",
+            "LOW_SVS_D0",
             "LOW_SVS",
+            "LOW_SVS_P1",
+            "LOW_SVS_L1",
+            "LOW_SVS_L2",
             "SVS",
+            "SVS_L0",
             "SVS_L1",
             "SVS_L2",
             "NOM",
+            "NOM_L0",
             "NOM_L1",
             "NOM_L2",
-            "NOM_L3",
             "TURBO",
+            "TURBO_L0",
             "TURBO_L1",
             "TURBO_L2",
+            "TURBO_L3",
+            "TURBO_L4",
             "SUPER_TURBO",
-            "SUPER_TURBO_NO_CPR",
-            "MAX"
+            "SUPER_TURBO_NO_CPR"
+        )
+    )
+
+    // Exact rpmh_levels_canoe (superset of all newer RPMh levels)
+    private val canoeRpmh = LevelTable(
+        levels = intArrayOf(
+            16, 48, 50, 51, 52, 54, 56, 60, 64, 72, 80, 96, 128, 144, 192,
+            224, 256, 288, 320, 336, 384, 400, 416, 432, 448, 452, 464, 480
+        ),
+        labels = arrayOf(
+            "RETENTION",
+            "MIN_SVS",
+            "LOW_SVS_D3",
+            "LOW_SVS_D2_5",
+            "LOW_SVS_D2",
+            "LOW_SVS_D1_5",
+            "LOW_SVS_D1",
+            "LOW_SVS_D0",
+            "LOW_SVS",
+            "LOW_SVS_P1",
+            "LOW_SVS_L1",
+            "LOW_SVS_L2",
+            "SVS",
+            "SVS_L0",
+            "SVS_L1",
+            "SVS_L2",
+            "NOM",
+            "NOM_L0",
+            "NOM_L1",
+            "NOM_L2",
+            "TURBO",
+            "TURBO_L0",
+            "TURBO_L1",
+            "TURBO_L2",
+            "TURBO_L3",
+            "TURBO_L4",
+            "SUPER_TURBO",
+            "SUPER_TURBO_NO_CPR"
         )
     )
 
     private fun tableForChip(chipType: KonaBessChipType): LevelTable {
         return when (chipType) {
-            KonaBessChipType.lito_v1, KonaBessChipType.lagoon -> litoV1AndLagoonRpmh
-            KonaBessChipType.msmnile, KonaBessChipType.msmnile_singleBin -> msmnileRpmh
-            else -> standardRpmh
+            KonaBessChipType.kona,
+            KonaBessChipType.kona_singleBin,
+            KonaBessChipType.lahaina_singleBin,
+            KonaBessChipType.lito_v1,
+            KonaBessChipType.lito_v2,
+            KonaBessChipType.lagoon,
+            KonaBessChipType.shima,
+            KonaBessChipType.yupik,
+            KonaBessChipType.waipio_singleBin,
+            KonaBessChipType.cape_singleBin,
+            KonaBessChipType.diwali,
+            KonaBessChipType.ukee_singleBin -> konaAndWaipioRpmh
+
+            KonaBessChipType.msmnile,
+            KonaBessChipType.msmnile_singleBin -> msmnileRpmh
+
+            KonaBessChipType.lahaina -> lahainaRpmh
+
+            KonaBessChipType.kalama,
+            KonaBessChipType.kalama_sg_singleBin,
+            KonaBessChipType.pineapple,
+            KonaBessChipType.cliffs_singleBin,
+            KonaBessChipType.cliffs_7_singleBin -> kalamaAndPineappleRpmh
+
+            KonaBessChipType.sun -> sunRpmh
+            KonaBessChipType.canoe -> canoeRpmh
+            KonaBessChipType.unknown -> kalamaAndPineappleRpmh
         }
     }
 
@@ -204,9 +345,11 @@ object KnownRpmhLabels {
         val idx = primary.levels.indexOf(code)
         if (idx >= 0) return primary.labels[idx]
 
-        // Fallback to standard RPMh if chipType was unknown or used standard RPMh codes
-        val stdIdx = standardRpmh.levels.indexOf(code)
-        if (stdIdx >= 0) return standardRpmh.labels[stdIdx]
+        // Fallback across all known Qualcomm RPMh tables if chipType was unknown or custom
+        for (fallback in listOf(kalamaAndPineappleRpmh, canoeRpmh, konaAndWaipioRpmh, lahainaRpmh, msmnileRpmh)) {
+            val fbIdx = fallback.levels.indexOf(code)
+            if (fbIdx >= 0) return fallback.labels[fbIdx]
+        }
 
         return "$code - LEVEL_$code"
     }
@@ -216,7 +359,6 @@ object KnownRpmhLabels {
         chipType: KonaBessChipType = KonaBessChipType.unknown
     ): Int? {
         val normalized = label.trim()
-        // If formatted as "48 - MIN_SVS" or similar from original KonaBess:
         if (normalized.contains(" - ")) {
             normalized.substringBefore(" - ").trim().toIntOrNull()?.let { return it }
         }
@@ -225,8 +367,10 @@ object KnownRpmhLabels {
         val primaryIdx = primary.labels.indexOfFirst { it.equals(upper, ignoreCase = true) }
         if (primaryIdx >= 0) return primary.levels[primaryIdx]
 
-        val stdIdx = standardRpmh.labels.indexOfFirst { it.equals(upper, ignoreCase = true) }
-        if (stdIdx >= 0) return standardRpmh.levels[stdIdx]
+        for (fallback in listOf(kalamaAndPineappleRpmh, canoeRpmh, konaAndWaipioRpmh, lahainaRpmh, msmnileRpmh)) {
+            val fbIdx = fallback.labels.indexOfFirst { it.equals(upper, ignoreCase = true) }
+            if (fbIdx >= 0) return fallback.levels[fbIdx]
+        }
 
         if (upper.startsWith("LEVEL_")) {
             return upper.removePrefix("LEVEL_").toIntOrNull()
@@ -257,9 +401,17 @@ object KnownRpmhLabels {
                 3 -> "Snapdragon 870"
                 else -> "Bin $binId"
             }
+            KonaBessChipType.kona_singleBin -> when (binId) {
+                0 -> "Snapdragon 865 (Single Bin)"
+                else -> "Bin $binId"
+            }
             KonaBessChipType.msmnile -> when (binId) {
                 0 -> "Snapdragon 855"
                 1 -> "Snapdragon 855+"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.msmnile_singleBin -> when (binId) {
+                0 -> "Snapdragon 855 (Single Bin)"
                 else -> "Bin $binId"
             }
             KonaBessChipType.lahaina -> when (binId) {
@@ -267,10 +419,13 @@ object KnownRpmhLabels {
                 3 -> "Snapdragon 888+"
                 else -> "Bin $binId"
             }
+            KonaBessChipType.lahaina_singleBin -> when (binId) {
+                0 -> "Snapdragon 888 (Single Bin)"
+                else -> "Bin $binId"
+            }
             KonaBessChipType.lito_v1, KonaBessChipType.lito_v2 -> when (binId) {
-                0 -> "Snapdragon 765"
                 1 -> "Snapdragon 765G"
-                2 -> "Snapdragon 768G"
+                3 -> "Snapdragon 765"
                 else -> "Bin $binId"
             }
             KonaBessChipType.lagoon -> when (binId) {
@@ -278,7 +433,15 @@ object KnownRpmhLabels {
                 else -> "Bin $binId"
             }
             KonaBessChipType.shima -> when (binId) {
-                0 -> "Snapdragon 780G"
+                1 -> "Snapdragon 780G"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.waipio_singleBin -> when (binId) {
+                0 -> "Snapdragon 8 Gen 1"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.cape_singleBin -> when (binId) {
+                0 -> "Snapdragon 8+ Gen 1"
                 else -> "Bin $binId"
             }
             KonaBessChipType.kalama -> when (binId) {
@@ -286,13 +449,29 @@ object KnownRpmhLabels {
                 1 -> "Snapdragon 8 Gen 2"
                 else -> "Bin $binId"
             }
+            KonaBessChipType.kalama_sg_singleBin -> when (binId) {
+                0 -> "Snapdragon G3x Gen 2"
+                else -> "Bin $binId"
+            }
             KonaBessChipType.diwali -> when (binId) {
                 3 -> "Snapdragon 7 Gen 1"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.ukee_singleBin -> when (binId) {
+                0 -> "Snapdragon 7+ Gen 2"
                 else -> "Bin $binId"
             }
             KonaBessChipType.pineapple -> when (binId) {
                 0 -> "Snapdragon 8 Gen 3 for Galaxy"
                 1 -> "Snapdragon 8 Gen 3"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.cliffs_singleBin -> when (binId) {
+                0 -> "Snapdragon 8s Gen 3"
+                else -> "Bin $binId"
+            }
+            KonaBessChipType.cliffs_7_singleBin -> when (binId) {
+                0 -> "Snapdragon 7+ Gen 3"
                 else -> "Bin $binId"
             }
             KonaBessChipType.sun -> when (binId) {

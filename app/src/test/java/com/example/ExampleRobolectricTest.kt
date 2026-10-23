@@ -18,13 +18,13 @@ class ExampleRobolectricTest {
     private val authenticDeviceDts = """
         /dts-v1/;
         / {
-            model = "Qualcomm Technologies, Inc. Kalama SoC";
+            model = "Qualcomm Technologies, Inc. Kalama v2";
             compatible = "qcom,kalama";
             qcom,kgsl-3d0@3d00000 {
                 qcom,gpu-pwrlevel-bins {
                     qcom,gpu-pwrlevels-0 {
                         compatible = "qcom,gpu-pwrlevels";
-                        qcom,initial-pwrlevel = <0x5>;
+                        qcom,initial-pwrlevel = <0x4>;
                         qcom,gpu-pwrlevel@0 {
                             reg = <0x0>;
                             qcom,gpu-freq = <0x2adb29c0>; /* 719 MHz */
@@ -44,7 +44,7 @@ class ExampleRobolectricTest {
                         qcom,gpu-pwrlevel@2 {
                             reg = <0x2>;
                             qcom,gpu-freq = <0x14be0f00>; /* 348 MHz */
-                            qcom,level = <0x60>; /* 96 = LOW_SVS_L2 */
+                            qcom,level = <0x3c>; /* 60 = LOW_SVS_D0 */
                             qcom,bus-freq = <0x3>;
                             qcom,bus-min = <0x2>;
                             qcom,bus-max = <0x5>;
@@ -52,7 +52,7 @@ class ExampleRobolectricTest {
                         qcom,gpu-pwrlevel@3 {
                             reg = <0x3>;
                             qcom,gpu-freq = <0x119557c0>; /* 295 MHz */
-                            qcom,level = <0x50>; /* 80 = LOW_SVS_L1 */
+                            qcom,level = <0x38>; /* 56 = LOW_SVS_D1 */
                             qcom,bus-freq = <0x2>;
                             qcom,bus-min = <0x1>;
                             qcom,bus-max = <0x3>;
@@ -60,7 +60,7 @@ class ExampleRobolectricTest {
                         qcom,gpu-pwrlevel@4 {
                             reg = <0x4>;
                             qcom,gpu-freq = <0xd1cef00>; /* 220 MHz */
-                            qcom,level = <0x40>; /* 64 = LOW_SVS */
+                            qcom,level = <0x34>; /* 52 = LOW_SVS_D2 */
                             qcom,bus-freq = <0x1>;
                             qcom,bus-min = <0x1>;
                             qcom,bus-max = <0x2>;
