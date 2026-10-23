@@ -199,7 +199,7 @@ fun SageKonaBessApp(
                 onUnpackDevice = { viewModel.unpackDeviceImage(forceReloadStock = true) },
                 onSaveTable = viewModel::saveFreqTableToDts,
                 onBackupImage = viewModel::backupOldImage,
-                onRepackAndFlash = viewModel::repackAndFlashImage
+                onRepackAndFlash = viewModel::requestFlashConfirmation
             )
 
             Box(modifier = Modifier.weight(1f)) {
@@ -285,6 +285,27 @@ fun SageKonaBessApp(
                 chipProfile = uiState.workspace.chipProfile,
                 onDismiss = viewModel::dismissOppRowEditor,
                 onSave = viewModel::saveEditedOppRow
+            )
+        }
+
+        if (uiState.showFlashConfirmDialog) {
+            ConfirmFlashDialog(
+                activePartition = uiState.activePartition,
+                modelName = uiState.workspace.chipProfile.modelName,
+                selectedDtbId = uiState.selectedDtbId,
+                modifiedStepsSummary = uiState.modifiedStepsSummary,
+                onDismiss = viewModel::dismissFlashConfirmation,
+                onConfirmFlash = viewModel::confirmAndRepackFlashImage
+            )
+        }
+
+        val flashReport = uiState.flashVerificationReport
+        if (flashReport != null) {
+            FlashVerificationAndRebootDialog(
+                report = flashReport,
+                modifiedStepsSummary = uiState.modifiedStepsSummary,
+                onDismiss = viewModel::dismissFlashVerificationDialog,
+                onRebootNow = viewModel::confirmRebootDevice
             )
         }
     }

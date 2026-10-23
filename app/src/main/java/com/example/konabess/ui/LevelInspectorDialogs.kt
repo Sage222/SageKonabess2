@@ -618,3 +618,318 @@ fun EditOppVoltRowDialog(
         }
     }
 }
+
+@Composable
+fun ConfirmFlashDialog(
+    activePartition: String,
+    modelName: String,
+    selectedDtbId: Int,
+    modifiedStepsSummary: List<String>,
+    onDismiss: () -> Unit,
+    onConfirmFlash: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = SlateSurface,
+            border = BorderStroke(1.dp, TelemetryCyan.copy(alpha = 0.6f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("confirm_flash_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Confirm Repack & Flash",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TelemetryCyan,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    text = "This will execute the original KonaBess repack & flash pipeline and verify the partition checksum:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = SlateElevated,
+                    border = BorderStroke(1.dp, BorderHairline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "Target: $activePartition",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TextPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Device DTB: ${if (selectedDtbId >= 0) "DTB #$selectedDtbId" else "Active DTB"} ($modelName)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary
+                        )
+                        Text(
+                            text = "Pipeline: Save .dts → dtc -I dts -O dtb -f → Link DTBs → magiskboot repack → dd flash → SHA-256 readback verify",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TelemetryCyan
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = SlateElevated,
+                    border = BorderStroke(1.dp, BorderHairline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = if (modifiedStepsSummary.isNotEmpty()) {
+                                "MODIFIED STEPS TO FLASH (${modifiedStepsSummary.size}):"
+                            } else {
+                                "TABLE STATUS:"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = UndervoltEmerald,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (modifiedStepsSummary.isEmpty()) {
+                            Text(
+                                text = "Current table matches stock DTB values (no modified rows).",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                        } else {
+                            modifiedStepsSummary.take(10).forEach { diffLine ->
+                                Text(
+                                    text = "• $diffLine",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextPrimary
+                                )
+                            }
+                            if (modifiedStepsSummary.size > 10) {
+                                Text(
+                                    text = "• ...and ${modifiedStepsSummary.size - 10} more step change(s)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("cancel_flash_button")
+                    ) {
+                        Text("Cancel", color = TextSecondary)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onConfirmFlash,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = TelemetryCyan,
+                            contentColor = Color(0xFF00242B)
+                        ),
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("confirm_flash_now_button")
+                    ) {
+                        Text("Confirm & Flash", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun FlashVerificationAndRebootDialog(
+    report: com.example.konabess.core.KonaBessShellEngine.FlashVerificationReport,
+    modifiedStepsSummary: List<String>,
+    onDismiss: () -> Unit,
+    onRebootNow: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        val borderColor = if (report.success) UndervoltEmerald else TurboCoral
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = SlateSurface,
+            border = BorderStroke(1.dp, borderColor.copy(alpha = 0.7f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("flash_result_reboot_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = if (report.success) {
+                        "Flash Verified Successful"
+                    } else {
+                        "Flash Failed"
+                    },
+                    style = MaterialTheme.typography.titleLarge,
+                    color = borderColor,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = SlateElevated,
+                    border = BorderStroke(1.dp, BorderHairline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (report.success) {
+                            Text(
+                                text = "Partition: ${report.targetPartitionPath.ifBlank { report.partitionLabel }}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "DTB Compiled: ${report.selectedDtbId}.dtb (${report.compiledDtbBytes / 1024} KB) • Linked ${report.totalDtbCount} DTB(s) (${report.linkedDtbBytes / 1024} KB)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = "Repacked Image: boot_new.img (${report.repackedImageBytes / 1024} KB)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = "Partition Readback Check: VERIFIED (SHA-256: ${report.imageSha256.take(16)}...)",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = UndervoltEmerald,
+                                fontWeight = FontWeight.Bold
+                            )
+                        } else {
+                            Text(
+                                text = "Failed Stage: ${report.failedStage ?: "Unknown"}",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TurboCoral,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (!report.errorMessage.isNullOrBlank()) {
+                                Text(
+                                    text = report.errorMessage,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextPrimary
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (report.success) {
+                    if (modifiedStepsSummary.isNotEmpty()) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = SlateElevated,
+                            border = BorderStroke(1.dp, BorderHairline),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "FLASHED GPU CHANGES (${modifiedStepsSummary.size}):",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TelemetryCyan,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                modifiedStepsSummary.take(6).forEach { line ->
+                                    Text(
+                                        text = "• $line",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextPrimary
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Text(
+                        text = "Flash has been verified on your partition. Would you like to reboot your device now to apply the new GPU frequency and voltage table?",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextSecondary
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(
+                            onClick = onDismiss,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("reboot_later_button")
+                        ) {
+                            Text("Reboot Later", color = TextSecondary)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = onRebootNow,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = UndervoltEmerald,
+                                contentColor = Color(0xFF002411)
+                            ),
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("reboot_now_button")
+                        ) {
+                            Text("Reboot System Now", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        Button(
+                            onClick = onDismiss,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SlateElevated,
+                                contentColor = TextPrimary
+                            ),
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("dismiss_flash_error_button")
+                        ) {
+                            Text("Close")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

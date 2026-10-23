@@ -586,6 +586,7 @@ object DtsParser {
 
             bin.levels.forEachIndexed { idx, row ->
                 lines.add("    qcom,gpu-pwrlevel@$idx {")
+                val levelPropStartIndex = lines.size
                 if (row.rawLines.isNotEmpty()) {
                     var wroteReg = false
                     var wroteFreq = false
@@ -631,7 +632,7 @@ object DtsParser {
                             else -> lines.add("        $origLine")
                         }
                     }
-                    if (!wroteReg) lines.add(1, "        reg = <0x${idx.toString(16)}>;")
+                    if (!wroteReg) lines.add(levelPropStartIndex, "        reg = <0x${idx.toString(16)}>;")
                     if (!wroteFreq) lines.add("        qcom,gpu-freq = <0x${row.frequencyHz.toString(16)}>;")
                     if (!wroteLevel) lines.add("        $levelKey = <0x${row.voltageLevelCode.toString(16)}>;")
                     if (!wroteBusFreq) lines.add("        qcom,bus-freq = <0x${row.busFreq.toString(16)}>;")
@@ -861,6 +862,15 @@ object DtsParser {
     }
 
     fun decodeHexLine(line: String): String {
+        val trimmed = line.trim().removeSuffix(";")
+        val eqIdx = trimmed.indexOf('=')
+        if (eqIdx >= 0) {
+            val rhs = trimmed.substring(eqIdx + 1).trim()
+            if (rhs.startsWith("\"")) {
+                val decoded = decodeStringedInt(rhs)
+                return "0x" + (decoded and 0xFFFFFFFFL).toString(16)
+            }
+        }
         val openIdx = line.indexOf('<')
         val closeIdx = line.indexOf('>')
         return if (openIdx >= 0 && closeIdx > openIdx) {

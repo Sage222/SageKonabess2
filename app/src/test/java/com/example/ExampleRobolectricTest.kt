@@ -118,4 +118,30 @@ class ExampleRobolectricTest {
         assertEquals(bottomSecondBefore.voltageLevelCode, bottomSecondAfter.voltageLevelCode)
         assertEquals(bottomFirstBefore.voltageLevelCode, bottomFirstAfter.voltageLevelCode)
     }
+
+    @Test
+    fun `viewModel tracks modifiedStepsSummary and opens pre-flash confirmation dialog without crashing`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val vm = KonaBessViewModel(app)
+
+        vm.importDtsOrConfigText(authenticDeviceDts, "Device DTB")
+        assertEquals(0, vm.uiState.value.modifiedStepsSummary.size)
+
+        // Adjust 295 MHz from LOW_SVS_D1 (56) down to LOW_SVS_D2 (52)
+        val row295 = vm.uiState.value.activeBin!!.levels.first { it.frequencyMHz == 295L }
+        vm.saveEditedFreqRow(row295.copy(voltageLevelCode = 52))
+
+        val summaries = vm.uiState.value.modifiedStepsSummary
+        assertEquals(1, summaries.size)
+        org.junit.Assert.assertTrue(summaries.first().contains("295 MHz"))
+        org.junit.Assert.assertTrue(summaries.first().contains("LOW_SVS_D1 → LOW_SVS_D2"))
+
+        // Request flash confirmation dialog
+        vm.requestFlashConfirmation()
+        org.junit.Assert.assertTrue(vm.uiState.value.showFlashConfirmDialog)
+
+        // Dismiss confirmation dialog
+        vm.dismissFlashConfirmation()
+        assertFalse(vm.uiState.value.showFlashConfirmDialog)
+    }
 }
