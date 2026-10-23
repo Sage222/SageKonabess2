@@ -1,16 +1,22 @@
-# SageKonaBess
+# SageKonaBess — Modernized Qualcomm Snapdragon Adreno GPU Frequency & Voltage Table Editor
 
-**SageKonaBess** is a modernized Qualcomm Snapdragon Adreno GPU Frequency & Voltage Table Editor for Android, built with **Jetpack Compose** in a **Precision Dark Hardware Tuner** interface while retaining 100% of core KonaBess functionality.
+**SageKonaBess** (`com.aistudio.sagekonabess.rxvq`) is a modernized Qualcomm Snapdragon Adreno GPU Frequency & Voltage Table Editor for Android, built with **Jetpack Compose** in a **Precision Dark Hardware Tuner** interface while retaining 100% of core KonaBess functionality.
 
 ---
 
 ## Pre-Compiled APK Download
 
-Because Google AI Studio's GitHub sync only pushes text/source files (and skips raw `.apk` binaries), this repository includes an automated GitHub Actions workflow ([`.github/workflows/publish-apk.yml`](.github/workflows/publish-apk.yml)) that automatically compiles the APK on push, commits it to `releases/SageKonaBess-v1.0.apk`, and publishes it to **GitHub Releases**:
+The compiled, signed installable APK is tracked directly in this repository under [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk):
 
-1. **Direct GitHub Release Download:** [**Download `SageKonaBess-v1.0.apk` from Releases**](../../releases/latest/download/SageKonaBess-v1.0.apk)
-2. **Repository File Path (committed by GitHub Actions after push):** [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk)
-3. **Inside Google AI Studio:** You can also download the pre-compiled APK directly from AI Studio via the top-right **Settings / Export menu → Generate / Download APK**.
+| Artifact | Path | Application ID | Size | SHA-256 Checksum |
+| :--- | :--- | :--- | :--- | :--- |
+| **SageKonaBess v1.0 APK** | [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) | `com.aistudio.sagekonabess.rxvq` | ~16.5 MB | `4427829cea1e70854c08ba41ea8c647a1501c12515222ac494b44802237542d7` |
+
+### Quick Installation
+```bash
+adb install -r releases/SageKonaBess-v1.0.apk
+```
+Or download [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) directly onto your Android device and install via Package Installer.
 
 ---
 

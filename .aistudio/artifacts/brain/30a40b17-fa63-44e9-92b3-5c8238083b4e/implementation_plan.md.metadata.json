@@ -1,6 +1,6 @@
 {
-  "summary":  "Updated implementation plan for SageKonaBess to enforce that ChipDefinition and voltage levels are never assumed globally, and instead are strictly derived from the default reading of the device's existing DTB/DTS values and KonaBess's chip detection.",
-  "updatedAt":  "2026-10-23T03:02:15.865203627Z",
+  "summary":  "Plan to track and sync releases/SageKonaBess-v1.0.apk directly in the repository (matching Sage222/SageSDKernel), fix the GitHub Actions workflow, and update README.md with the direct relative APK path and SHA-256 checksum.",
+  "updatedAt":  "2026-10-23T04:15:25.314625924Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

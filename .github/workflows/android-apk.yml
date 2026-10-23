@@ -1,0 +1,26 @@
+name: Build & Publish SageKonaBess APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Upload Pre-Compiled APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SageKonaBess-v1.0-apk
+          path: releases/SageKonaBess-v1.0.apk
