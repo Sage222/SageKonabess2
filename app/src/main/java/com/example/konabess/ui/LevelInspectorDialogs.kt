@@ -50,6 +50,7 @@ import com.example.konabess.model.GpuFreqRow
 import com.example.konabess.model.GpuOppVoltRow
 import com.example.konabess.model.KnownRpmhLabels
 import com.example.ui.theme.BorderHairline
+import com.example.ui.theme.NominalAmber
 import com.example.ui.theme.SlateElevated
 import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TelemetryCyan
@@ -763,6 +764,102 @@ fun ConfirmFlashDialog(
 }
 
 @Composable
+fun ConfirmRestoreDefaultsDialog(
+    activePartition: String,
+    backupImageSourceSummary: String,
+    onDismiss: () -> Unit,
+    onConfirmRestoreDefaults: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = SlateSurface,
+            border = BorderStroke(1.dp, NominalAmber.copy(alpha = 0.7f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("confirm_restore_defaults_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Restore to Defaults (Flash Backup)",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = NominalAmber,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    text = "This will flash your original backed-up boot image directly back to your partition and reset the GPU frequency & voltage table to stock defaults:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary
+                )
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = SlateElevated,
+                    border = BorderStroke(1.dp, BorderHairline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = "Target Partition: $activePartition",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = TextPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Backup Image Source: $backupImageSourceSummary",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = NominalAmber
+                        )
+                        Text(
+                            text = "Pipeline: Locate original backup .img → dd flash to partition → SHA-256 readback verify → Restore stock GPU table",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TelemetryCyan
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("cancel_restore_defaults_button")
+                    ) {
+                        Text("Cancel", color = TextSecondary)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onConfirmRestoreDefaults,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NominalAmber,
+                            contentColor = Color(0xFF261700)
+                        ),
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("confirm_restore_defaults_now_button")
+                    ) {
+                        Text("Restore & Flash Backup", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun FlashVerificationAndRebootDialog(
     report: com.example.konabess.core.KonaBessShellEngine.FlashVerificationReport,
     modifiedStepsSummary: List<String>,
@@ -786,10 +883,11 @@ fun FlashVerificationAndRebootDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = if (report.success) {
-                        "Flash Verified Successful"
-                    } else {
-                        "Flash Failed"
+                    text = when {
+                        report.success && report.isRestoreDefaultImage -> "Restore to Defaults Verified"
+                        report.success -> "Flash Verified Successful"
+                        report.isRestoreDefaultImage -> "Restore to Defaults Failed"
+                        else -> "Flash Failed"
                     },
                     style = MaterialTheme.typography.titleLarge,
                     color = borderColor,
@@ -813,16 +911,24 @@ fun FlashVerificationAndRebootDialog(
                                 color = TextPrimary,
                                 fontWeight = FontWeight.Bold
                             )
-                            Text(
-                                text = "DTB Compiled: ${report.selectedDtbId}.dtb (${report.compiledDtbBytes / 1024} KB) • Linked ${report.totalDtbCount} DTB(s) (${report.linkedDtbBytes / 1024} KB)",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary
-                            )
-                            Text(
-                                text = "Repacked Image: boot_new.img (${report.repackedImageBytes / 1024} KB)",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary
-                            )
+                            if (report.isRestoreDefaultImage) {
+                                Text(
+                                    text = "Flashed Original Backup: ${report.sourceImagePath.ifBlank { "boot.img" }} (${report.repackedImageBytes / 1024} KB)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = NominalAmber
+                                )
+                            } else {
+                                Text(
+                                    text = "DTB Compiled: ${report.selectedDtbId}.dtb (${report.compiledDtbBytes / 1024} KB) • Linked ${report.totalDtbCount} DTB(s) (${report.linkedDtbBytes / 1024} KB)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary
+                                )
+                                Text(
+                                    text = "Repacked Image: boot_new.img (${report.repackedImageBytes / 1024} KB)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary
+                                )
+                            }
                             Text(
                                 text = "Partition Readback Check: VERIFIED (SHA-256: ${report.imageSha256.take(16)}...)",
                                 style = MaterialTheme.typography.labelMedium,
@@ -848,7 +954,7 @@ fun FlashVerificationAndRebootDialog(
                 }
 
                 if (report.success) {
-                    if (modifiedStepsSummary.isNotEmpty()) {
+                    if (!report.isRestoreDefaultImage && modifiedStepsSummary.isNotEmpty()) {
                         Surface(
                             shape = RoundedCornerShape(10.dp),
                             color = SlateElevated,
@@ -877,7 +983,11 @@ fun FlashVerificationAndRebootDialog(
                     }
 
                     Text(
-                        text = "Flash has been verified on your partition. Would you like to reboot your device now to apply the new GPU frequency and voltage table?",
+                        text = if (report.isRestoreDefaultImage) {
+                            "Your original backed-up boot image has been flashed and verified on your partition. Would you like to reboot your device now to restore default GPU settings?"
+                        } else {
+                            "Flash has been verified on your partition. Would you like to reboot your device now to apply the new GPU frequency and voltage table?"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary
                     )

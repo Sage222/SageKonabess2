@@ -199,7 +199,8 @@ fun SageKonaBessApp(
                 onUnpackDevice = { viewModel.unpackDeviceImage(forceReloadStock = true) },
                 onSaveTable = viewModel::saveFreqTableToDts,
                 onBackupImage = viewModel::backupOldImage,
-                onRepackAndFlash = viewModel::requestFlashConfirmation
+                onRepackAndFlash = viewModel::requestFlashConfirmation,
+                onRestoreDefaults = viewModel::requestRestoreDefaultsConfirmation
             )
 
             Box(modifier = Modifier.weight(1f)) {
@@ -296,6 +297,15 @@ fun SageKonaBessApp(
                 modifiedStepsSummary = uiState.modifiedStepsSummary,
                 onDismiss = viewModel::dismissFlashConfirmation,
                 onConfirmFlash = viewModel::confirmAndRepackFlashImage
+            )
+        }
+
+        if (uiState.showRestoreDefaultsConfirmDialog) {
+            ConfirmRestoreDefaultsDialog(
+                activePartition = uiState.activePartition,
+                backupImageSourceSummary = uiState.backupImageSourceSummary,
+                onDismiss = viewModel::dismissRestoreDefaultsConfirmation,
+                onConfirmRestoreDefaults = viewModel::confirmAndRestoreDefaultBootImage
             )
         }
 

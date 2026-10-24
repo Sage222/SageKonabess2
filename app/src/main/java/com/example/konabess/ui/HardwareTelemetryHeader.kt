@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.DeveloperBoard
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -89,6 +90,7 @@ fun HardwareTelemetryHeader(
     onSaveTable: () -> Unit,
     onBackupImage: () -> Unit,
     onRepackAndFlash: () -> Unit,
+    onRestoreDefaults: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -378,6 +380,36 @@ fun HardwareTelemetryHeader(
                                 maxLines = 1
                             )
                         }
+                    }
+
+                    // Restore to Defaults Button (Flashes Original Backed-Up Boot Image)
+                    OutlinedButton(
+                        onClick = onRestoreDefaults,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, NominalAmber.copy(alpha = 0.55f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = SlateElevated,
+                            contentColor = NominalAmber
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("restore_defaults_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Restore,
+                            contentDescription = "Restore to Defaults and Flash Original Backed-Up Boot Image",
+                            tint = NominalAmber,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Restore to Defaults (Flash Backed-Up Boot Image)",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
             }

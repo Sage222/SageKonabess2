@@ -48,6 +48,8 @@ data class KonaBessUiState(
     val editingOppRow: GpuOppVoltRow? = null,
     val showNewFreqDialog: Boolean = false,
     val showFlashConfirmDialog: Boolean = false,
+    val showRestoreDefaultsConfirmDialog: Boolean = false,
+    val backupImageSourceSummary: String = "/sdcard/vendor_boot.img",
     val flashVerificationReport: KonaBessShellEngine.FlashVerificationReport? = null,
     val statusBannerMessage: String? = null,
     val isStatusHighlightSuccess: Boolean = true,
@@ -922,6 +924,114 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
 
     fun dismissFlashVerificationDialog() {
         _uiState.update { it.copy(flashVerificationReport = null) }
+    }
+
+    /**
+     * Opens the Restore to Defaults Confirmation Dialog when the user taps Restore to Defaults.
+     */
+    fun requestRestoreDefaultsConfirmation() {
+        _uiState.update { it.copy(showRestoreDefaultsConfirmDialog = true) }
+        viewModelScope.launch {
+            try {
+                val summary = shellEngine.describeAvailableBackupSource()
+                _uiState.update { it.copy(backupImageSourceSummary = summary) }
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun dismissRestoreDefaultsConfirmation() {
+        _uiState.update { it.copy(showRestoreDefaultsConfirmDialog = false) }
+    }
+
+    /**
+     * Flashes the original backed-up boot image (`/sdcard/<boot_name>.img`,
+     * `<filesDir>/backup_<boot_name>.img`, or `<filesDir>/boot.img`) back to the active
+     * partition via `dd`, verifies the partition readback SHA-256, resets the GPU table workspace
+     * to stock defaults, and shows the verification + reboot prompt dialog.
+     */
+    fun confirmAndRestoreDefaultBootImage() {
+        viewModelScope.launch {
+            val state = _uiState.value
+            _uiState.update {
+                it.copy(
+                    showRestoreDefaultsConfirmDialog = false,
+                    isLoading = true,
+                    isFlashing = true,
+                    statusBannerMessage = "Flashing original backed-up boot image & verifying partition..."
+                )
+            }
+            try {
+                val result = shellEngine.restoreOriginalBootImageAndFlash(state.selectedDtbId)
+
+                val restoredWorkspace = withContext(Dispatchers.Default) {
+                    val authoritativeStock = result.stockDtsContent
+                        .ifBlank { result.dtsContent }
+                        .ifBlank { untouchedStockDts }
+                    if (authoritativeStock.isNotBlank()) {
+                        untouchedStockDts = authoritativeStock
+                        DtsParser.parseDts(
+                            authoritativeStock,
+                            result.activePartition.ifBlank { state.activePartition },
+                            result.selectedDtbId.takeIf { it >= 0 } ?: state.selectedDtbId,
+                            state.workspace.chipProfile.chipType
+                        )
+                    } else {
+                        val restoredBins = state.workspace.bins.map { bin ->
+                            bin.copy(levels = bin.stockLevels.map { it.copy() })
+                        }
+                        val restoredOpp = state.workspace.oppVoltRows.map {
+                            it.copy(microvoltOrLevel = it.stockMicrovoltOrLevel)
+                        }
+                        state.workspace.copy(
+                            bins = restoredBins,
+                            oppVoltRows = restoredOpp
+                        )
+                    }
+                }
+
+                stepHistoryByBin.clear()
+                oppStepHistory.clear()
+
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        isFlashing = false,
+                        workspace = if (restoredWorkspace.bins.isNotEmpty()) restoredWorkspace else current.workspace,
+                        netStepDropsByBin = emptyMap(),
+                        flashVerificationReport = result.flashVerification,
+                        shellLogs = current.shellLogs + result.logs,
+                        statusBannerMessage = if (result.success && result.hasRootAccess) {
+                            "Restored original backed-up image (${result.flashVerification?.sourceImagePath ?: result.bootName}) & verified partition! Ready to reboot."
+                        } else {
+                            result.flashVerification?.errorMessage
+                                ?: result.logs.lastOrNull()
+                                ?: "Restore to defaults failed."
+                        },
+                        isStatusHighlightSuccess = result.success
+                    )
+                }
+            } catch (t: Throwable) {
+                val errMsg = "Restore to defaults failed: ${t.message ?: t.javaClass.simpleName}"
+                appendLog("[Restore Error] $errMsg")
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        isFlashing = false,
+                        flashVerificationReport = KonaBessShellEngine.FlashVerificationReport(
+                            success = false,
+                            isRestoreDefaultImage = true,
+                            failedStage = "Restore Pipeline",
+                            partitionLabel = current.activePartition,
+                            selectedDtbId = current.selectedDtbId,
+                            errorMessage = errMsg
+                        ),
+                        statusBannerMessage = errMsg,
+                        isStatusHighlightSuccess = false
+                    )
+                }
+            }
+        }
     }
 
     /**

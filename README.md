@@ -10,7 +10,7 @@ The compiled, signed installable APK is tracked directly in this repository unde
 
 | Artifact | Path | Application ID | Size | SHA-256 Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **SageKonaBess v1.0 APK** | [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) | `com.aistudio.sagekonabess.rxvq` | ~18.0 MB | `af225ac3507a6eb7809b5aa6dcb6930f1cb0941aa316147dcf09260c2cd2abcd` |
+| **SageKonaBess v1.0 APK** | [`releases/SageKonaBess-v1.0.apk`](releases/SageKonaBess-v1.0.apk) | `com.aistudio.sagekonabess.rxvq` | ~18.0 MB | `b72e1b5d72cbffd46d6791caec4c34dea16776187f5a36ae2395d15979d1c1fb` |
 
 ### Quick Installation
 ```bash
@@ -36,8 +36,10 @@ Instead of manually editing every single GPU clock step one by one, SageKonaBess
 - **Zero Assumed Voltage Tiers:** SageKonaBess **never assumes** a fixed global list of voltage bins (for instance, devices that do not have or use `NOM` or `TURBO_L1` will never have those bins assumed or injected).
 - All available voltage levels, `qcom,level` / `qcom,cx-ipeak` keys, speed bins, and `qcom,gpu-opp-table` curves are derived **strictly from reading the existing values** in the unpacked DTB/DTS or imported configuration.
 
-### 3. Retained Core KonaBess Capabilities
-- **Boot / Vendor_Boot Unpack & Repack:** Unpack the active device `boot` or `vendor_boot` partition via root shell (`su`), backup the untouched stock partition image, decompile DTB to DTS, and repack/flash modified tables.
+### 3. Retained Core KonaBess Capabilities & Safe Flash / Restore Pipeline
+- **Boot / Vendor_Boot Unpack & Repack (`magiskboot` + `dtc`):** Unpack the active device `boot` or `vendor_boot` partition via root shell (`su`), backup the untouched stock partition image, decompile DTB to DTS, and repack/flash modified tables using the original `KonaBessCore` pipeline (`dtc -I dts -O dtb -f`, multi-DTB linking, `magiskboot repack boot.img boot_new.img`, and `dd` to `/dev/block/bootdevice/by-name/<boot_name><slot>`).
+- **Pre-Flash Confirmation, SHA-256 Readback Verification & Reboot Prompt:** Before flashing, a confirmation dialog summarizes all modified GPU steps; after flashing, the partition is read back and verified via SHA-256 checksum before offering a one-tap **Reboot System Now** confirmation.
+- **One-Tap Restore to Defaults (Flash Backed-Up Boot Image):** Tap **Restore to Defaults (Flash Backed-Up Boot Image)** to flash the original backed-up boot image (`/sdcard/<boot_name>.img` or automatic pristine `<filesDir>/backup_<boot_name>.img`) directly back to your partition via `dd`, verify the partition SHA-256 readback, reset the GPU table workspace to stock defaults, and prompt for reboot.
 - **Full Multi-Bin GPU Frequency Table Editor (`qcom,gpu-pwrlevels`):**
   - Edit individual clock speeds (`qcom,gpu-freq`), voltage levels (`qcom,level` / `qcom,cx-ipeak`), DDR bus frequencies (`qcom,bus-freq`, `qcom,bus-min`, `qcom,bus-max`), ACD levels (`qcom,acd-level`), and initial boot power level (`qcom,initial-pwrlevel`).
   - Insert new frequency steps, clone/duplicate existing steps, or delete steps.

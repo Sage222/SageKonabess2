@@ -143,5 +143,30 @@ class ExampleRobolectricTest {
         // Dismiss confirmation dialog
         vm.dismissFlashConfirmation()
         assertFalse(vm.uiState.value.showFlashConfirmDialog)
+
+        // Request Restore to Defaults confirmation dialog
+        vm.requestRestoreDefaultsConfirmation()
+        org.junit.Assert.assertTrue(vm.uiState.value.showRestoreDefaultsConfirmDialog)
+
+        // Dismiss Restore to Defaults confirmation dialog
+        vm.dismissRestoreDefaultsConfirmation()
+        assertFalse(vm.uiState.value.showRestoreDefaultsConfirmDialog)
+    }
+
+    @Test
+    fun `shellEngine resolves original backed up boot image from filesDir backup`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val backupFile = java.io.File(context.filesDir, "backup_vendor_boot.img")
+        backupFile.writeBytes(ByteArray(4096) { 0x5A })
+        try {
+            val engine = com.example.konabess.core.KonaBessShellEngine(context)
+            val resolved = engine.resolveOriginalBackupImage(rootAvailable = false)
+            org.junit.Assert.assertNotNull(resolved)
+            assertEquals("vendor_boot", resolved!!.bootName)
+            assertEquals(4096L, resolved.sizeBytes)
+        } finally {
+            backupFile.delete()
+        }
     }
 }
+
