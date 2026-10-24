@@ -47,14 +47,20 @@ data class KonaBessUiState(
     val editingFreqRow: GpuFreqRow? = null,
     val editingOppRow: GpuOppVoltRow? = null,
     val showNewFreqDialog: Boolean = false,
+    val showCreateBackupDialog: Boolean = false,
     val showFlashConfirmDialog: Boolean = false,
     val showRestoreDefaultsConfirmDialog: Boolean = false,
+    val availableBackups: List<KonaBessShellEngine.SavedBootBackup> = emptyList(),
+    val selectedBackupId: String? = null,
     val backupImageSourceSummary: String = "/sdcard/vendor_boot.img",
     val flashVerificationReport: KonaBessShellEngine.FlashVerificationReport? = null,
     val statusBannerMessage: String? = null,
     val isStatusHighlightSuccess: Boolean = true,
     val shellLogs: List<String> = emptyList()
 ) {
+    val selectedBackup: KonaBessShellEngine.SavedBootBackup?
+        get() = availableBackups.firstOrNull { it.id == selectedBackupId }
+            ?: availableBackups.firstOrNull()
     val activeBin: GpuPowerBin?
         get() = workspace.bins.firstOrNull { it.binIndex == selectedBinIndex }
             ?: workspace.bins.firstOrNull()
@@ -833,17 +839,72 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
         return DtsParser.serializeToDts(_uiState.value.workspace)
     }
 
-    fun backupOldImage() {
+    /**
+     * Opens the Create Named Backup dialog when the user taps Backup.
+     */
+    fun openCreateBackupDialog() {
+        _uiState.update { it.copy(showCreateBackupDialog = true) }
+    }
+
+    fun dismissCreateBackupDialog() {
+        _uiState.update { it.copy(showCreateBackupDialog = false) }
+    }
+
+    /**
+     * Creates a named backup image (either Stock unpacked boot.img or Repacked Modified GPU table)
+     * and refreshes the list of available backups.
+     */
+    fun createNamedBackup(backupName: String, saveModifiedTable: Boolean) {
         viewModelScope.launch {
-            val (ok, message) = shellEngine.createBackupImageCopy()
-            appendLog("[Backup] $message")
+            val state = _uiState.value
             _uiState.update {
                 it.copy(
-                    statusBannerMessage = message,
-                    isStatusHighlightSuccess = ok
+                    showCreateBackupDialog = false,
+                    isLoading = true,
+                    statusBannerMessage = if (saveModifiedTable) {
+                        "Repacking current modified GPU table & saving backup \"$backupName\"..."
+                    } else {
+                        "Saving stock boot image backup \"$backupName\"..."
+                    }
                 )
             }
+            try {
+                val currentDtsText = withContext(Dispatchers.Default) {
+                    DtsParser.serializeToDts(state.workspace)
+                }
+                val (ok, message) = shellEngine.createNamedBackupImage(
+                    backupName = backupName,
+                    saveModifiedTable = saveModifiedTable,
+                    currentDtsContent = currentDtsText,
+                    preferredDtbId = state.selectedDtbId
+                )
+                val refreshedBackups = shellEngine.listAvailableBackups()
+                appendLog("[Backup] $message")
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        availableBackups = refreshedBackups,
+                        selectedBackupId = refreshedBackups.firstOrNull()?.id,
+                        statusBannerMessage = message,
+                        isStatusHighlightSuccess = ok
+                    )
+                }
+            } catch (t: Throwable) {
+                val err = "Backup failed: ${t.message}"
+                appendLog("[Backup Error] $err")
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusBannerMessage = err,
+                        isStatusHighlightSuccess = false
+                    )
+                }
+            }
         }
+    }
+
+    fun backupOldImage() {
+        createNamedBackup(backupName = "Stock", saveModifiedTable = false)
     }
 
     /**
@@ -927,15 +988,48 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Opens the Restore to Defaults Confirmation Dialog when the user taps Restore to Defaults.
+     * Opens the Load / Restore Backed-Up Image Picker Dialog and loads all available backups.
      */
     fun requestRestoreDefaultsConfirmation() {
         _uiState.update { it.copy(showRestoreDefaultsConfirmDialog = true) }
+        refreshAvailableBackups()
+    }
+
+    fun refreshAvailableBackups() {
         viewModelScope.launch {
             try {
+                val backups = shellEngine.listAvailableBackups()
                 val summary = shellEngine.describeAvailableBackupSource()
-                _uiState.update { it.copy(backupImageSourceSummary = summary) }
+                _uiState.update { current ->
+                    val chosenId = current.selectedBackupId?.takeIf { id -> backups.any { it.id == id } }
+                        ?: backups.firstOrNull()?.id
+                    current.copy(
+                        availableBackups = backups,
+                        selectedBackupId = chosenId,
+                        backupImageSourceSummary = summary
+                    )
+                }
             } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun selectBackupToRestore(backupId: String) {
+        _uiState.update { it.copy(selectedBackupId = backupId) }
+    }
+
+    fun deleteSavedBackup(backup: KonaBessShellEngine.SavedBootBackup) {
+        viewModelScope.launch {
+            val (ok, msg) = shellEngine.deleteNamedBackup(backup)
+            val backups = shellEngine.listAvailableBackups()
+            appendLog("[Backup Delete] $msg")
+            _uiState.update { current ->
+                current.copy(
+                    availableBackups = backups,
+                    selectedBackupId = backups.firstOrNull()?.id,
+                    statusBannerMessage = msg,
+                    isStatusHighlightSuccess = ok
+                )
             }
         }
     }
@@ -945,33 +1039,123 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
     }
 
     /**
-     * Flashes the original backed-up boot image (`/sdcard/<boot_name>.img`,
-     * `<filesDir>/backup_<boot_name>.img`, or `<filesDir>/boot.img`) back to the active
-     * partition via `dd`, verifies the partition readback SHA-256, resets the GPU table workspace
-     * to stock defaults, and shows the verification + reboot prompt dialog.
+     * Loads a selected backup image into the GPU frequency & voltage table editor without flashing
+     * the partition yet, allowing the user to inspect or tweak a previously backed-up image.
      */
-    fun confirmAndRestoreDefaultBootImage() {
+    fun loadSelectedBackupIntoEditor(backup: KonaBessShellEngine.SavedBootBackup? = _uiState.value.selectedBackup) {
+        val targetBackup = backup ?: return
         viewModelScope.launch {
             val state = _uiState.value
             _uiState.update {
                 it.copy(
                     showRestoreDefaultsConfirmDialog = false,
                     isLoading = true,
-                    isFlashing = true,
-                    statusBannerMessage = "Flashing original backed-up boot image & verifying partition..."
+                    statusBannerMessage = "Loading backup \"${targetBackup.displayName}\" into editor..."
                 )
             }
             try {
-                val result = shellEngine.restoreOriginalBootImageAndFlash(state.selectedDtbId)
+                val result = shellEngine.loadBackupIntoWorkspace(targetBackup, state.selectedDtbId)
+                if (result.dtsContent.isBlank()) {
+                    _uiState.update { current ->
+                        current.copy(
+                            isLoading = false,
+                            shellLogs = current.shellLogs + result.logs,
+                            statusBannerMessage = "Could not unpack GPU table from backup \"${targetBackup.displayName}\".",
+                            isStatusHighlightSuccess = false
+                        )
+                    }
+                    return@launch
+                }
+
+                val loadedWorkspace = withContext(Dispatchers.Default) {
+                    val stockRefDts = result.stockDtsContent.ifBlank { untouchedStockDts }.ifBlank { result.dtsContent }
+                    val stockParsed = DtsParser.parseDts(
+                        stockRefDts,
+                        result.activePartition.ifBlank { state.activePartition },
+                        result.selectedDtbId.takeIf { it >= 0 } ?: state.selectedDtbId,
+                        state.workspace.chipProfile.chipType
+                    )
+                    val loadedParsed = DtsParser.parseDts(
+                        result.dtsContent,
+                        result.activePartition.ifBlank { state.activePartition },
+                        result.selectedDtbId.takeIf { it >= 0 } ?: state.selectedDtbId,
+                        stockParsed.chipProfile.chipType
+                    )
+                    val mergedBins = loadedParsed.bins.map { bin ->
+                        val matchingStock = stockParsed.bins.firstOrNull { it.binIndex == bin.binIndex }
+                        if (matchingStock != null) {
+                            bin.copy(stockLevels = matchingStock.stockLevels.map { it.copy() })
+                        } else {
+                            bin
+                        }
+                    }
+                    loadedParsed.copy(bins = mergedBins)
+                }
+
+                stepHistoryByBin.clear()
+                oppStepHistory.clear()
+
+                _uiState.update { current ->
+                    current.copy(
+                        isLoading = false,
+                        activePartition = result.activePartition.ifBlank { current.activePartition },
+                        workspace = if (loadedWorkspace.bins.isNotEmpty()) loadedWorkspace else current.workspace,
+                        netStepDropsByBin = emptyMap(),
+                        shellLogs = current.shellLogs + result.logs,
+                        statusBannerMessage = "Loaded backup \"${targetBackup.displayName}\" (${targetBackup.backupModeLabel}) into editor. Tap Flash to write to partition.",
+                        isStatusHighlightSuccess = true
+                    )
+                }
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusBannerMessage = "Failed loading backup: ${t.message}",
+                        isStatusHighlightSuccess = false
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Flashes the user-selected backed-up boot image (or the default original backup if none is
+     * selected) back to the active partition via `dd`, verifies the partition readback SHA-256,
+     * updates the GPU table workspace, and shows the verification + reboot prompt dialog.
+     */
+    fun confirmAndRestoreDefaultBootImage(explicitBackup: KonaBessShellEngine.SavedBootBackup? = null) {
+        viewModelScope.launch {
+            val state = _uiState.value
+            val chosenBackup = explicitBackup ?: state.selectedBackup
+            _uiState.update {
+                it.copy(
+                    showRestoreDefaultsConfirmDialog = false,
+                    isLoading = true,
+                    isFlashing = true,
+                    statusBannerMessage = if (chosenBackup != null) {
+                        "Flashing backup \"${chosenBackup.displayName}\" & verifying partition..."
+                    } else {
+                        "Flashing original backed-up boot image & verifying partition..."
+                    }
+                )
+            }
+            try {
+                val result = if (chosenBackup != null) {
+                    shellEngine.restoreSelectedBackupAndFlash(chosenBackup, state.selectedDtbId)
+                } else {
+                    shellEngine.restoreOriginalBootImageAndFlash(state.selectedDtbId)
+                }
 
                 val restoredWorkspace = withContext(Dispatchers.Default) {
-                    val authoritativeStock = result.stockDtsContent
-                        .ifBlank { result.dtsContent }
+                    val authoritativeDts = result.dtsContent
+                        .ifBlank { result.stockDtsContent }
                         .ifBlank { untouchedStockDts }
-                    if (authoritativeStock.isNotBlank()) {
-                        untouchedStockDts = authoritativeStock
+                    if (authoritativeDts.isNotBlank()) {
+                        if (chosenBackup == null || chosenBackup.backupModeLabel == "STOCK") {
+                            untouchedStockDts = authoritativeDts
+                        }
                         DtsParser.parseDts(
-                            authoritativeStock,
+                            authoritativeDts,
                             result.activePartition.ifBlank { state.activePartition },
                             result.selectedDtbId.takeIf { it >= 0 } ?: state.selectedDtbId,
                             state.workspace.chipProfile.chipType
@@ -1002,17 +1186,17 @@ class KonaBessViewModel(application: Application) : AndroidViewModel(application
                         flashVerificationReport = result.flashVerification,
                         shellLogs = current.shellLogs + result.logs,
                         statusBannerMessage = if (result.success && result.hasRootAccess) {
-                            "Restored original backed-up image (${result.flashVerification?.sourceImagePath ?: result.bootName}) & verified partition! Ready to reboot."
+                            "Restored backup (${result.flashVerification?.sourceImagePath ?: result.bootName}) & verified partition! Ready to reboot."
                         } else {
                             result.flashVerification?.errorMessage
                                 ?: result.logs.lastOrNull()
-                                ?: "Restore to defaults failed."
+                                ?: "Restore backup failed."
                         },
                         isStatusHighlightSuccess = result.success
                     )
                 }
             } catch (t: Throwable) {
-                val errMsg = "Restore to defaults failed: ${t.message ?: t.javaClass.simpleName}"
+                val errMsg = "Restore backup failed: ${t.message ?: t.javaClass.simpleName}"
                 appendLog("[Restore Error] $errMsg")
                 _uiState.update { current ->
                     current.copy(

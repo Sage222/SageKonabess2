@@ -200,7 +200,7 @@ fun HardwareTelemetryHeader(
                                         )
                                     ) {
                                         Text(
-                                            text = if (hasRootAccess) "ROOT SHELL" else "UNROOTED / IMPORT",
+                                            text = if (hasRootAccess) "ROOT SHELL" else "NO ROOT",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = if (hasRootAccess) UndervoltEmerald else TelemetryCyan,
                                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
@@ -382,7 +382,7 @@ fun HardwareTelemetryHeader(
                         }
                     }
 
-                    // Restore to Defaults Button (Flashes Original Backed-Up Boot Image)
+                    // Load / Restore Backed-Up Image Button (Allows choosing Stock or Named Backups)
                     OutlinedButton(
                         onClick = onRestoreDefaults,
                         shape = RoundedCornerShape(10.dp),
@@ -398,13 +398,13 @@ fun HardwareTelemetryHeader(
                     ) {
                         Icon(
                             imageVector = Icons.Default.Restore,
-                            contentDescription = "Restore to Defaults and Flash Original Backed-Up Boot Image",
+                            contentDescription = "Load or Restore Backed-Up Boot Image",
                             tint = NominalAmber,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "Restore to Defaults (Flash Backed-Up Boot Image)",
+                            text = "Load / Restore Backed-Up Image",
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,

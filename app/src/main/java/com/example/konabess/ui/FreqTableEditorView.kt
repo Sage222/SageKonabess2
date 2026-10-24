@@ -440,7 +440,7 @@ private fun FreqTableRowCard(
                 }
             }
 
-            // Bottom telemetry row: Visual Diff Badge (Previous vs Current) & Next Step Preview
+            // Bottom telemetry row: Visual Diff Badge (when modified in session) & Next Step Preview
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -460,11 +460,7 @@ private fun FreqTableRowCard(
                         )
                     }
                 } else {
-                    Text(
-                        text = "STOCK LEVEL: $currentLabel (0x${row.voltageLevelCode.toString(16)})",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextMuted
-                    )
+                    Spacer(modifier = Modifier.width(1.dp))
                 }
 
                 if (!isBottomTwoLocked && nextLowerFreqRow != null) {

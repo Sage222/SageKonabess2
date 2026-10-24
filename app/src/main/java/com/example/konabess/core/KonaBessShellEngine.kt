@@ -47,6 +47,19 @@ class KonaBessShellEngine(private val context: Context) {
         val sizeBytes: Long
     )
 
+    data class SavedBootBackup(
+        val id: String,
+        val displayName: String,
+        val fileName: String,
+        val path: String,
+        val localMirrorPath: String,
+        val bootName: String,
+        val sizeBytes: Long,
+        val lastModifiedMs: Long,
+        val backupModeLabel: String, // "STOCK" or "MODIFIED"
+        val isBuiltInDefault: Boolean = false
+    )
+
     data class FlashVerificationReport(
         val success: Boolean,
         val isRestoreDefaultImage: Boolean = false,
@@ -955,48 +968,540 @@ class KonaBessShellEngine(private val context: Context) {
             }
         }
 
+    fun sanitizeBackupFileToken(rawName: String): String {
+        val cleaned = rawName.trim()
+            .replace(Regex("\\s+"), "_")
+            .replace(Regex("[^A-Za-z0-9_.-]"), "")
+            .trim('_', '.', '-')
+        return cleaned.ifBlank { "Backup" }.take(48)
+    }
+
     /**
-     * Exact port of `KonaBessCore.backupBootImage()`:
-     * Copies `<filesDir>/boot.img` to `/sdcard/<boot_name>.img` (and keeps a synchronized copy
-     * at `<filesDir>/backup_<boot_name>.img` for one-tap Restore to Defaults).
+     * Creates a named backup of either:
+     * - `saveModifiedTable = false`: The original/stock unpacked boot image (`backup_<bootName>.img` or `boot.img`).
+     * - `saveModifiedTable = true`: Compiles `currentDtsContent` into `<dtbId>.dtb`, links `dtb`, and repacks
+     *   `boot_new.img` via `magiskboot repack boot.img boot_new.img` so the named backup `.img` contains the
+     *   user's modified GPU frequency & voltage table ready to restore/flash at any time.
+     *
+     * Backups are saved to `/sdcard/KonaBessBackups/<safeName>__<bootName>.img` and mirrored in
+     * `<filesDir>/backups/<safeName>__<bootName>.img`.
      */
-    suspend fun createBackupImageCopy(): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+    suspend fun createNamedBackupImage(
+        backupName: String,
+        saveModifiedTable: Boolean,
+        currentDtsContent: String = "",
+        preferredDtbId: Int = -1
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        val logs = mutableListOf<String>()
         try {
             recoverWorkspaceMetadataFromDiskIfNeeded()
-            val bootImg = File(filesDir, "boot.img")
-            if (!bootImg.exists() || bootImg.length() == 0L) {
-                return@withContext Pair(
-                    false,
-                    "No unpacked boot.img found. Unpack device image first before backing up."
-                )
+            val (dtcPath, magiskbootPath) = setupEnv(logs)
+            val rootAvailable = checkRootAccess()
+            val slotSuffix = getSlotSuffix(rootAvailable)
+            val targetId = if (preferredDtbId >= 0) preferredDtbId else activeDtbId.coerceAtLeast(0)
+
+            val displayTitle = backupName.trim().ifBlank {
+                if (saveModifiedTable) "Modified" else "Stock"
             }
-            val localBackup = File(filesDir, "backup_$bootName.img")
-            try {
-                bootImg.copyTo(localBackup, overwrite = true)
-                localBackup.setReadable(true, false)
-                localBackup.setWritable(true, false)
-            } catch (_: Throwable) {
+            val safeToken = sanitizeBackupFileToken(displayTitle)
+            val modeLabel = if (saveModifiedTable) "MODIFIED" else "STOCK"
+
+            val backupsDir = File(filesDir, "backups").apply { mkdirs() }
+            val fileBaseName = "${safeToken}__${bootName}"
+            val localBackupImg = File(backupsDir, "$fileBaseName.img")
+            val localBackupDts = File(backupsDir, "$fileBaseName.dts")
+            val localBackupMeta = File(backupsDir, "$fileBaseName.meta")
+
+            val bootImg = File(filesDir, "boot.img")
+            val pristineStockImg = File(filesDir, "backup_$bootName.img")
+
+            // If boot.img is not unpacked yet and root is available, extract from partition first
+            if ((!bootImg.exists() || bootImg.length() == 0L) && rootAvailable) {
+                ddPartitionToBootImg(bootName, slotSuffix, logs)
+                if (bootImg.exists() && bootImg.length() > 0L && (!pristineStockImg.exists() || pristineStockImg.length() == 0L)) {
+                    runCatching { bootImg.copyTo(pristineStockImg, overwrite = true) }
+                }
             }
 
-            val destPath = "/sdcard/$bootName.img"
-            val (exitCode, out) = execShell("cp -f '${bootImg.absolutePath}' '$destPath'", useRoot = true)
-            if (exitCode == 0) {
-                Pair(true, "Backed up stock $bootName.img to $destPath (${bootImg.length() / 1024} KB).")
+            var sourceImgForBackup: File? = null
+
+            if (saveModifiedTable) {
+                if (currentDtsContent.isNotBlank()) {
+                    val activeDtsFile = File(filesDir, "$targetId.dts")
+                    writeFileSafely(activeDtsFile, currentDtsContent, useRootFallback = rootAvailable, logs = logs)
+                    writeFileSafely(localBackupDts, currentDtsContent, useRootFallback = false)
+                }
+
+                // Repack boot_new.img with the modified DTS if boot.img and DTB slices are available
+                if (bootImg.exists() && bootImg.length() > 0L && dtbNum > 0 && rootAvailable) {
+                    var dtcOk = true
+                    for (i in 0 until dtbNum) {
+                        val srcDts = File(filesDir, "$i.dts")
+                        val outDtb = File(filesDir, "$i.dtb")
+                        val stockDtbSlice = File(filesDir, "$i.dtb.stock")
+                        if (outDtb.exists() && !outDtb.delete()) {
+                            execShell("rm -f '${outDtb.absolutePath}'", useRoot = true)
+                        }
+                        val (exitCode, _) = execShell(
+                            "'$dtcPath' -I dts -O dtb -f -q '${srcDts.absolutePath}' -o '${outDtb.absolutePath}'",
+                            useRoot = true
+                        )
+                        if (exitCode != 0 || !outDtb.exists() || outDtb.length() <= 4L) {
+                            if (i != targetId && stockDtbSlice.exists() && stockDtbSlice.length() > 4L) {
+                                stockDtbSlice.copyTo(outDtb, overwrite = true)
+                            } else {
+                                dtcOk = false
+                                break
+                            }
+                        }
+                    }
+
+                    if (dtcOk) {
+                        ensureWorkspaceFilesWritable()
+                        val dtbOutFile = File(filesDir, "dtb")
+                        val kernelDtbOutFile = File(filesDir, "kernel_dtb")
+                        execShell("rm -f '${dtbOutFile.absolutePath}' '${kernelDtbOutFile.absolutePath}'", useRoot = true)
+                        val linkTarget = if (dtbType == DtbType.KERNEL_DTB) kernelDtbOutFile else dtbOutFile
+                        BufferedOutputStream(FileOutputStream(linkTarget)).use { bos ->
+                            for (i in 0 until dtbNum) {
+                                val singleDtb = File(filesDir, "$i.dtb")
+                                if (singleDtb.exists()) {
+                                    bos.write(singleDtb.readBytes())
+                                }
+                            }
+                        }
+                        if (dtbType == DtbType.BOTH) {
+                            linkTarget.copyTo(kernelDtbOutFile, overwrite = true)
+                        }
+
+                        val bootNewFile = File(filesDir, "boot_new.img")
+                        val altBootNewFile = File(filesDir, "new-boot.img")
+                        execShell("rm -f '${bootNewFile.absolutePath}' '${altBootNewFile.absolutePath}'", useRoot = true)
+                        val (repackExit, _) = execShell(
+                            "cd '${filesDir.absolutePath}' && '$magiskbootPath' repack boot.img boot_new.img",
+                            useRoot = true
+                        )
+                        ensureWorkspaceFilesWritable()
+                        if (!bootNewFile.exists() && altBootNewFile.exists()) {
+                            altBootNewFile.renameTo(bootNewFile)
+                        }
+                        if (repackExit == 0 && bootNewFile.exists() && bootNewFile.length() > 0L) {
+                            sourceImgForBackup = bootNewFile
+                        }
+                    }
+                }
+
+                if (sourceImgForBackup == null) {
+                    sourceImgForBackup = when {
+                        bootImg.exists() && bootImg.length() > 0L -> bootImg
+                        pristineStockImg.exists() && pristineStockImg.length() > 0L -> pristineStockImg
+                        else -> null
+                    }
+                }
             } else {
-                Pair(true, "Backed up $bootName.img to ${localBackup.absolutePath} ($out).")
+                // Backing up Stock / Original Unpacked Image
+                val stockDtsFile = File(filesDir, "$targetId.dts.stock")
+                val fallbackDtsFile = File(filesDir, "$targetId.dts")
+                val stockDtsToSave = when {
+                    stockDtsFile.exists() && stockDtsFile.length() > 0L -> stockDtsFile.readText()
+                    fallbackDtsFile.exists() && fallbackDtsFile.length() > 0L -> fallbackDtsFile.readText()
+                    else -> currentDtsContent
+                }
+                if (stockDtsToSave.isNotBlank()) {
+                    writeFileSafely(localBackupDts, stockDtsToSave, useRootFallback = false)
+                }
+                sourceImgForBackup = when {
+                    pristineStockImg.exists() && pristineStockImg.length() > 0L -> pristineStockImg
+                    bootImg.exists() && bootImg.length() > 0L -> bootImg
+                    else -> null
+                }
             }
+
+            if (sourceImgForBackup != null && sourceImgForBackup.exists() && sourceImgForBackup.length() > 0L) {
+                sourceImgForBackup.copyTo(localBackupImg, overwrite = true)
+                localBackupImg.setReadable(true, false)
+                localBackupImg.setWritable(true, false)
+            } else if (currentDtsContent.isNotBlank()) {
+                // In non-rooted / unit-test workspace without binary boot.img, persist the DTS snapshot
+                // inside localBackupImg so named backups can still be created, listed, and restored in tests.
+                writeFileSafely(localBackupImg, currentDtsContent, useRootFallback = false)
+            } else {
+                return@withContext Pair(
+                    false,
+                    "No unpacked boot.img found. Unpack device image first before creating a backup."
+                )
+            }
+
+            val nowMs = System.currentTimeMillis()
+            val metaText = buildString {
+                appendLine("displayName=$displayTitle")
+                appendLine("bootName=$bootName")
+                appendLine("mode=$modeLabel")
+                appendLine("timestampMs=$nowMs")
+            }
+            writeFileSafely(localBackupMeta, metaText, useRootFallback = false)
+
+            // Also keep standard /sdcard/<bootName>.img and <filesDir>/backup_<bootName>.img updated if Stock
+            if (!saveModifiedTable && localBackupImg.exists() && localBackupImg.length() > 0L) {
+                if (!pristineStockImg.exists() || pristineStockImg.length() == 0L) {
+                    runCatching { localBackupImg.copyTo(pristineStockImg, overwrite = true) }
+                }
+                if (rootAvailable) {
+                    execShell("cp -f '${localBackupImg.absolutePath}' '/sdcard/$bootName.img'", useRoot = true)
+                }
+            }
+
+            val sdcardDir = "/sdcard/KonaBessBackups"
+            val sdcardImgPath = "$sdcardDir/$fileBaseName.img"
+            val sdcardMetaPath = "$sdcardDir/$fileBaseName.meta"
+            val sdcardDtsPath = "$sdcardDir/$fileBaseName.dts"
+
+            if (rootAvailable) {
+                val copyCmd = buildString {
+                    append("mkdir -p '$sdcardDir' && ")
+                    append("cp -f '${localBackupImg.absolutePath}' '$sdcardImgPath' && ")
+                    append("cp -f '${localBackupMeta.absolutePath}' '$sdcardMetaPath'")
+                    if (localBackupDts.exists()) {
+                        append(" && cp -f '${localBackupDts.absolutePath}' '$sdcardDtsPath'")
+                    }
+                }
+                val (exitCode, _) = execShell(copyCmd, useRoot = true)
+                if (exitCode == 0) {
+                    return@withContext Pair(
+                        true,
+                        "Saved $modeLabel backup \"$displayTitle\" to $sdcardImgPath (${localBackupImg.length() / 1024} KB)."
+                    )
+                }
+            }
+
+            Pair(
+                true,
+                "Saved $modeLabel backup \"$displayTitle\" (${localBackupImg.name}, ${localBackupImg.length() / 1024} KB)."
+            )
         } catch (t: Throwable) {
             Pair(false, "Backup error: ${t.message}")
         }
     }
 
     /**
+     * Exact port of `KonaBessCore.backupBootImage()` (kept for direct stock backup calls):
+     */
+    suspend fun createBackupImageCopy(): Pair<Boolean, String> {
+        return createNamedBackupImage(
+            backupName = "Stock",
+            saveModifiedTable = false
+        )
+    }
+
+    /**
+     * Lists all available boot image backups (both user-named Stock/Modified backups and built-in
+     * default backups) so the user can choose which one to restore/flash or load into the editor.
+     */
+    suspend fun listAvailableBackups(): List<SavedBootBackup> = withContext(Dispatchers.IO) {
+        recoverWorkspaceMetadataFromDiskIfNeeded()
+        val rootAvailable = checkRootAccess()
+        val backupsByFileKey = linkedMapOf<String, SavedBootBackup>()
+
+        val backupsDir = File(filesDir, "backups")
+        val sdcardDir = "/sdcard/KonaBessBackups"
+
+        // 1. If root is available, sync any .img/.meta/.dts files from /sdcard/KonaBessBackups into <filesDir>/backups
+        // so backups created prior to an app reinstall are immediately discoverable and readable.
+        if (rootAvailable) {
+            backupsDir.mkdirs()
+            val appUid = Process.myUid()
+            execShell(
+                "if [ -d '$sdcardDir' ]; then " +
+                    "cp -n '$sdcardDir'/*.img '$sdcardDir'/*.meta '$sdcardDir'/*.dts '${backupsDir.absolutePath}/' 2>/dev/null || true; " +
+                    "chown -R $appUid:$appUid '${backupsDir.absolutePath}' 2>/dev/null || true; " +
+                    "chmod -R u+rwX,go+rwX '${backupsDir.absolutePath}' 2>/dev/null || true; " +
+                    "fi",
+                useRoot = true
+            )
+        }
+
+        // 2. Scan <filesDir>/backups/*.img
+        val internalFiles = backupsDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".img") && it.length() > 0L }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+
+        for (imgFile in internalFiles) {
+            val baseName = imgFile.name.removeSuffix(".img")
+            val metaFile = File(backupsDir, "$baseName.meta")
+            val props = if (metaFile.exists()) {
+                runCatching {
+                    metaFile.readLines().associate {
+                        it.substringBefore("=").trim() to it.substringAfter("=", "").trim()
+                    }
+                }.getOrDefault(emptyMap())
+            } else {
+                emptyMap()
+            }
+
+            val parsedBootName = props["bootName"]?.takeIf { it.isNotBlank() }
+                ?: when {
+                    baseName.endsWith("__vendor_boot") -> "vendor_boot"
+                    baseName.endsWith("__boot") -> "boot"
+                    else -> bootName
+                }
+            val rawTitle = props["displayName"]?.takeIf { it.isNotBlank() }
+                ?: baseName.removeSuffix("__$parsedBootName").replace('_', ' ')
+            val modeLabel = props["mode"]?.takeIf { it.isNotBlank() }
+                ?: if (rawTitle.contains("stock", ignoreCase = true)) "STOCK" else "MODIFIED"
+            val timestamp = props["timestampMs"]?.toLongOrNull() ?: imgFile.lastModified()
+
+            val sdcardCandidatePath = "$sdcardDir/${imgFile.name}"
+            val displayPath = if (rootAvailable || File(sdcardCandidatePath).exists()) {
+                sdcardCandidatePath
+            } else {
+                imgFile.absolutePath
+            }
+
+            backupsByFileKey[imgFile.name] = SavedBootBackup(
+                id = imgFile.name,
+                displayName = rawTitle,
+                fileName = imgFile.name,
+                path = displayPath,
+                localMirrorPath = imgFile.absolutePath,
+                bootName = parsedBootName,
+                sizeBytes = imgFile.length(),
+                lastModifiedMs = timestamp,
+                backupModeLabel = modeLabel,
+                isBuiltInDefault = false
+            )
+        }
+
+        // 3. Also check built-in default stock backups (/sdcard/<bootName>.img & <filesDir>/backup_<bootName>.img)
+        val candidateBootNames = (listOf(bootName) + listOf("vendor_boot", "boot")).distinct()
+        for (name in candidateBootNames) {
+            val internalPristine = File(filesDir, "backup_$name.img")
+            val sdcardDefaultPath = "/sdcard/$name.img"
+            val sdcardDefaultFile = File(sdcardDefaultPath)
+
+            var defaultSize = 0L
+            var defaultLastMod = System.currentTimeMillis()
+            var resolvedPath = ""
+            var localMirror = ""
+
+            if (internalPristine.exists() && internalPristine.length() > 0L) {
+                defaultSize = internalPristine.length()
+                defaultLastMod = internalPristine.lastModified()
+                localMirror = internalPristine.absolutePath
+                resolvedPath = if (rootAvailable || sdcardDefaultFile.exists()) sdcardDefaultPath else internalPristine.absolutePath
+            } else if (sdcardDefaultFile.exists() && sdcardDefaultFile.length() > 0L) {
+                defaultSize = sdcardDefaultFile.length()
+                defaultLastMod = sdcardDefaultFile.lastModified()
+                resolvedPath = sdcardDefaultPath
+                localMirror = sdcardDefaultPath
+            } else if (rootAvailable) {
+                val (exit, out) = execShell("if [ -s '$sdcardDefaultPath' ]; then wc -c < '$sdcardDefaultPath'; fi", useRoot = true)
+                val bytes = out.trim().lineSequence().firstOrNull()?.trim()?.toLongOrNull() ?: 0L
+                if (exit == 0 && bytes > 0L) {
+                    defaultSize = bytes
+                    resolvedPath = sdcardDefaultPath
+                    localMirror = sdcardDefaultPath
+                }
+            }
+
+            if (defaultSize > 0L && resolvedPath.isNotBlank()) {
+                val key = "default_stock_$name.img"
+                backupsByFileKey[key] = SavedBootBackup(
+                    id = key,
+                    displayName = "Original Unpacked Stock ($name)",
+                    fileName = "$name.img",
+                    path = resolvedPath,
+                    localMirrorPath = localMirror.ifBlank { resolvedPath },
+                    bootName = name,
+                    sizeBytes = defaultSize,
+                    lastModifiedMs = defaultLastMod,
+                    backupModeLabel = "STOCK",
+                    isBuiltInDefault = true
+                )
+            }
+        }
+
+        // 4. Fallback to unpacked <filesDir>/boot.img if no other backup exists yet
+        if (backupsByFileKey.isEmpty()) {
+            val unpackedBootImg = File(filesDir, "boot.img")
+            if (unpackedBootImg.exists() && unpackedBootImg.length() > 0L) {
+                backupsByFileKey["workspace_boot.img"] = SavedBootBackup(
+                    id = "workspace_boot.img",
+                    displayName = "Current Unpacked Boot Image ($bootName)",
+                    fileName = "boot.img",
+                    path = unpackedBootImg.absolutePath,
+                    localMirrorPath = unpackedBootImg.absolutePath,
+                    bootName = bootName,
+                    sizeBytes = unpackedBootImg.length(),
+                    lastModifiedMs = unpackedBootImg.lastModified(),
+                    backupModeLabel = "STOCK",
+                    isBuiltInDefault = true
+                )
+            }
+        }
+
+        backupsByFileKey.values.sortedWith(
+            compareByDescending<SavedBootBackup> { !it.isBuiltInDefault }
+                .thenByDescending { it.lastModifiedMs }
+        )
+    }
+
+    /**
+     * Deletes a user-created named backup from `<filesDir>/backups` and `/sdcard/KonaBessBackups`.
+     */
+    suspend fun deleteNamedBackup(backup: SavedBootBackup): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        if (backup.isBuiltInDefault) {
+            return@withContext Pair(false, "Built-in original stock backup cannot be deleted.")
+        }
+        return@withContext try {
+            val backupsDir = File(filesDir, "backups")
+            val baseName = backup.fileName.removeSuffix(".img")
+            File(backupsDir, backup.fileName).delete()
+            File(backupsDir, "$baseName.meta").delete()
+            File(backupsDir, "$baseName.dts").delete()
+
+            if (checkRootAccess()) {
+                val sdcardDir = "/sdcard/KonaBessBackups"
+                execShell(
+                    "rm -f '$sdcardDir/${backup.fileName}' '$sdcardDir/$baseName.meta' '$sdcardDir/$baseName.dts'",
+                    useRoot = true
+                )
+            }
+            Pair(true, "Deleted backup \"${backup.displayName}\".")
+        } catch (t: Throwable) {
+            Pair(false, "Failed to delete backup: ${t.message}")
+        }
+    }
+
+    /**
+     * Loads a previously backed-up boot image into the active GPU frequency table editor workspace
+     * without flashing the partition yet, allowing the user to inspect or edit a saved backup.
+     */
+    suspend fun loadBackupIntoWorkspace(
+        backup: SavedBootBackup,
+        preferredDtbId: Int
+    ): ShellExecutionResult = withContext(Dispatchers.IO) {
+        val logs = mutableListOf<String>()
+        val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        recoverWorkspaceMetadataFromDiskIfNeeded()
+
+        val targetId = if (preferredDtbId >= 0) preferredDtbId else activeDtbId.coerceAtLeast(0)
+        val rootAvailable = checkRootAccess()
+        val slotSuffix = getSlotSuffix(rootAvailable)
+        val (dtcPath, magiskbootPath) = setupEnv(logs)
+
+        try {
+            val backupsDir = File(filesDir, "backups")
+            val baseName = backup.fileName.removeSuffix(".img")
+            val companionDts = File(backupsDir, "$baseName.dts")
+
+            val sourcePath = if (File(backup.localMirrorPath).exists() && File(backup.localMirrorPath).length() > 0L) {
+                backup.localMirrorPath
+            } else {
+                backup.path
+            }
+
+            bootName = backup.bootName
+            val partLabel = "$bootName$slotSuffix (DTB #$targetId • Loaded: ${backup.displayName})"
+
+            // Preserve current .dts.stock so the editor can still compare against stock if available
+            val stockFile = File(filesDir, "$targetId.dts.stock")
+            val preservedStockText = if (stockFile.exists() && stockFile.length() > 0L) {
+                stockFile.readText()
+            } else {
+                ""
+            }
+
+            if (rootAvailable && File(sourcePath).let { it.exists() || sourcePath.startsWith("/sdcard/") }) {
+                val appUid = Process.myUid()
+                val workspaceBootImg = File(filesDir, "boot.img")
+                val (cpExit, _) = execShell(
+                    "cp -f '$sourcePath' '${workspaceBootImg.absolutePath}' && " +
+                        "chown $appUid:$appUid '${workspaceBootImg.absolutePath}' && " +
+                        "chmod 666 '${workspaceBootImg.absolutePath}'",
+                    useRoot = true
+                )
+                if (cpExit == 0 && unpackBootImgAndDecompileDtbs(dtcPath, magiskbootPath, logs)) {
+                    val refreshedDtbs = checkDeviceDtbs(logs)
+                    if (refreshedDtbs.isNotEmpty()) {
+                        cachedDtbs = refreshedDtbs
+                    }
+                    ensureWorkspaceFilesWritable()
+                    if (preservedStockText.isNotBlank()) {
+                        writeFileSafely(stockFile, preservedStockText, useRootFallback = true)
+                    }
+                    val loadedDtsFile = File(filesDir, "$targetId.dts")
+                    val loadedText = if (loadedDtsFile.exists()) loadedDtsFile.readText() else ""
+                    if (loadedText.isNotBlank()) {
+                        logs.add("[$ts] Unpacked backup \"${backup.displayName}\" (${backup.fileName}) into editor.")
+                        return@withContext ShellExecutionResult(
+                            success = true,
+                            hasRootAccess = true,
+                            activePartition = partLabel,
+                            bootName = bootName,
+                            dtsContent = loadedText,
+                            stockDtsContent = preservedStockText.ifBlank { loadedText },
+                            detectedDtbs = cachedDtbs,
+                            selectedDtbId = targetId,
+                            logs = logs
+                        )
+                    }
+                }
+            }
+
+            // Companion DTS or non-root/test fallback
+            val fallbackDtsText = when {
+                companionDts.exists() && companionDts.length() > 0L -> companionDts.readText()
+                File(sourcePath).exists() -> runCatching { File(sourcePath).readText() }.getOrDefault("")
+                else -> ""
+            }
+            if (fallbackDtsText.contains("qcom,gpu-pwrlevels")) {
+                val activeDtsFile = File(filesDir, "$targetId.dts")
+                writeFileSafely(activeDtsFile, fallbackDtsText, useRootFallback = rootAvailable)
+                logs.add("[$ts] Loaded backup \"${backup.displayName}\" into editor workspace.")
+                return@withContext ShellExecutionResult(
+                    success = true,
+                    hasRootAccess = rootAvailable,
+                    activePartition = partLabel,
+                    bootName = bootName,
+                    dtsContent = fallbackDtsText,
+                    stockDtsContent = preservedStockText.ifBlank { fallbackDtsText },
+                    detectedDtbs = cachedDtbs,
+                    selectedDtbId = targetId,
+                    logs = logs
+                )
+            }
+
+            logs.add("[$ts] Could not unpack backup \"${backup.displayName}\" from $sourcePath.")
+            ShellExecutionResult(
+                success = false,
+                hasRootAccess = rootAvailable,
+                activePartition = partLabel,
+                bootName = bootName,
+                dtsContent = "",
+                stockDtsContent = preservedStockText,
+                detectedDtbs = cachedDtbs,
+                selectedDtbId = targetId,
+                logs = logs
+            )
+        } catch (t: Throwable) {
+            logs.add("[$ts] Failed loading backup \"${backup.displayName}\": ${t.message}")
+            ShellExecutionResult(
+                success = false,
+                hasRootAccess = rootAvailable,
+                activePartition = "$bootName$slotSuffix",
+                bootName = bootName,
+                dtsContent = "",
+                stockDtsContent = "",
+                detectedDtbs = cachedDtbs,
+                selectedDtbId = targetId,
+                logs = logs
+            )
+        }
+    }
+
+    /**
      * Locates the original backed-up boot image to flash when the user taps "Restore to Defaults".
-     * Search priority:
-     * 1. `/sdcard/<bootName>.img` (standard KonaBess backup path created by `backupBootImage()`)
-     * 2. `/storage/emulated/0/<bootName>.img`
-     * 3. `<filesDir>/backup_<bootName>.img` (pristine backup copy saved on initial unpack / backup)
-     * 4. `<filesDir>/boot.img` (the unpacked original partition image prior to `boot_new.img` repack)
      */
     fun resolveOriginalBackupImage(rootAvailable: Boolean): BackupImageCandidate? {
         recoverWorkspaceMetadataFromDiskIfNeeded()
@@ -1046,7 +1551,7 @@ class KonaBessShellEngine(private val context: Context) {
 
     /**
      * Returns a human-readable summary of the original backup image that will be flashed
-     * by "Restore to Defaults".
+     * by default.
      */
     suspend fun describeAvailableBackupSource(): String = withContext(Dispatchers.IO) {
         recoverWorkspaceMetadataFromDiskIfNeeded()
@@ -1060,272 +1565,109 @@ class KonaBessShellEngine(private val context: Context) {
     }
 
     /**
-     * Flashes the original backed-up boot image (`/sdcard/<boot_name>.img`,
-     * `<filesDir>/backup_<boot_name>.img`, or `<filesDir>/boot.img`) directly to
-     * `/dev/block/bootdevice/by-name/<boot_name><slot>` via `dd`, verifies the flashed partition
-     * SHA-256 readback, and restores the workspace `.dts` files to stock defaults.
+     * Flashes a user-selected `SavedBootBackup` directly to `/dev/block/bootdevice/by-name/<boot_name><slot>`
+     * via `dd`, verifies the flashed partition SHA-256 readback, unpacks the restored image into the
+     * workspace, and returns the verification report so the user can reboot.
      */
-    suspend fun restoreOriginalBootImageAndFlash(preferredDtbId: Int): ShellExecutionResult =
-        withContext(Dispatchers.IO) {
-            val logs = mutableListOf<String>()
-            val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-            recoverWorkspaceMetadataFromDiskIfNeeded()
+    suspend fun restoreSelectedBackupAndFlash(
+        backup: SavedBootBackup,
+        preferredDtbId: Int
+    ): ShellExecutionResult = withContext(Dispatchers.IO) {
+        val logs = mutableListOf<String>()
+        val ts = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        recoverWorkspaceMetadataFromDiskIfNeeded()
 
-            val targetId = if (preferredDtbId >= 0) preferredDtbId else activeDtbId.coerceAtLeast(0)
-            val existingDtsFile = File(filesDir, "$targetId.dts")
-            val existingStockFile = File(filesDir, "$targetId.dts.stock")
-            val fallbackStockText = try {
-                when {
-                    existingStockFile.exists() && existingStockFile.length() > 0L -> existingStockFile.readText()
-                    existingDtsFile.exists() && existingDtsFile.length() > 0L -> existingDtsFile.readText()
-                    else -> ""
-                }
-            } catch (_: Throwable) {
-                ""
+        val targetId = if (preferredDtbId >= 0) preferredDtbId else activeDtbId.coerceAtLeast(0)
+        val existingDtsFile = File(filesDir, "$targetId.dts")
+        val existingStockFile = File(filesDir, "$targetId.dts.stock")
+        val fallbackStockText = try {
+            when {
+                existingStockFile.exists() && existingStockFile.length() > 0L -> existingStockFile.readText()
+                existingDtsFile.exists() && existingDtsFile.length() > 0L -> existingDtsFile.readText()
+                else -> ""
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+
+        try {
+            val (dtcPath, magiskbootPath) = setupEnv(logs)
+            val rootAvailable = checkRootAccess()
+            val slotSuffix = getSlotSuffix(rootAvailable)
+            val partLabel = "${backup.bootName}$slotSuffix (DTB #$targetId)"
+
+            val sourcePath = if (File(backup.localMirrorPath).exists() && File(backup.localMirrorPath).length() > 0L) {
+                backup.localMirrorPath
+            } else {
+                backup.path
             }
 
-            try {
-                val (dtcPath, magiskbootPath) = setupEnv(logs)
-                val rootAvailable = checkRootAccess()
-                val slotSuffix = getSlotSuffix(rootAvailable)
-                val partLabel = "$bootName$slotSuffix (DTB #$targetId)"
-
-                if (!rootAvailable) {
-                    val err = "Root access (su) is required to flash the original backed-up $bootName.img to $bootName$slotSuffix."
-                    logs.add("[$ts] $err")
-                    return@withContext ShellExecutionResult(
-                        success = false,
-                        hasRootAccess = false,
-                        activePartition = partLabel,
-                        bootName = bootName,
-                        dtsContent = fallbackStockText,
-                        stockDtsContent = fallbackStockText,
-                        detectedDtbs = cachedDtbs,
-                        selectedDtbId = targetId,
-                        logs = logs,
-                        flashVerification = FlashVerificationReport(
-                            success = false,
-                            isRestoreDefaultImage = true,
-                            sourceImagePath = "/sdcard/$bootName.img",
-                            failedStage = "Root Access Check (su)",
-                            partitionLabel = "$bootName$slotSuffix",
-                            selectedDtbId = targetId,
-                            totalDtbCount = dtbNum,
-                            errorMessage = err
-                        )
-                    )
-                }
-
-                val backupCandidate = resolveOriginalBackupImage(rootAvailable = true)
-                if (backupCandidate == null || backupCandidate.sizeBytes <= 0L) {
-                    val err = "No backed-up boot image found at /sdcard/$bootName.img or ${File(filesDir, "backup_$bootName.img").absolutePath}. Tap Backup first or place $bootName.img in /sdcard/."
-                    logs.add("[$ts] $err")
-                    return@withContext ShellExecutionResult(
-                        success = false,
-                        hasRootAccess = true,
-                        activePartition = partLabel,
-                        bootName = bootName,
-                        dtsContent = fallbackStockText,
-                        stockDtsContent = fallbackStockText,
-                        detectedDtbs = cachedDtbs,
-                        selectedDtbId = targetId,
-                        logs = logs,
-                        flashVerification = FlashVerificationReport(
-                            success = false,
-                            isRestoreDefaultImage = true,
-                            sourceImagePath = "/sdcard/$bootName.img",
-                            failedStage = "Locate Original Backed-Up Boot Image",
-                            partitionLabel = "$bootName$slotSuffix",
-                            selectedDtbId = targetId,
-                            totalDtbCount = dtbNum,
-                            errorMessage = err
-                        )
-                    )
-                }
-
-                bootName = backupCandidate.bootName
-                val resolvedPartLabel = "$bootName$slotSuffix (DTB #$targetId)"
-                logs.add(
-                    "[$ts] Step 1/4: Located original backup image ${backupCandidate.path} " +
-                        "(${backupCandidate.sizeBytes / 1024} KB)."
-                )
-
-                val targetPartitionPath = resolveBlockDevicePath(bootName, slotSuffix)
-                if (targetPartitionPath == null) {
-                    val err = "Could not locate block device for $bootName$slotSuffix."
-                    logs.add("[$ts] $err")
-                    return@withContext ShellExecutionResult(
-                        success = false,
-                        hasRootAccess = true,
-                        activePartition = resolvedPartLabel,
-                        bootName = bootName,
-                        dtsContent = fallbackStockText,
-                        stockDtsContent = fallbackStockText,
-                        detectedDtbs = cachedDtbs,
-                        selectedDtbId = targetId,
-                        logs = logs,
-                        flashVerification = FlashVerificationReport(
-                            success = false,
-                            isRestoreDefaultImage = true,
-                            sourceImagePath = backupCandidate.path,
-                            failedStage = "Resolve Partition Block Device",
-                            partitionLabel = "$bootName$slotSuffix",
-                            selectedDtbId = targetId,
-                            totalDtbCount = dtbNum,
-                            repackedImageBytes = backupCandidate.sizeBytes,
-                            errorMessage = err
-                        )
-                    )
-                }
-
-                // Step 2: Flash the original backed-up boot image directly via dd
-                val ddCmd = "blockdev --setrw '$targetPartitionPath' 2>/dev/null || true; " +
-                    "dd if='${backupCandidate.path}' of='$targetPartitionPath' && sync"
-                val (ddExit, ddOut) = execShell(ddCmd, useRoot = true)
-                if (ddExit != 0) {
-                    val err = "dd restore from ${backupCandidate.path} to $targetPartitionPath failed (exit=$ddExit): $ddOut"
-                    logs.add("[$ts] $err")
-                    return@withContext ShellExecutionResult(
-                        success = false,
-                        hasRootAccess = true,
-                        activePartition = resolvedPartLabel,
-                        bootName = bootName,
-                        dtsContent = fallbackStockText,
-                        stockDtsContent = fallbackStockText,
-                        detectedDtbs = cachedDtbs,
-                        selectedDtbId = targetId,
-                        logs = logs,
-                        flashVerification = FlashVerificationReport(
-                            success = false,
-                            isRestoreDefaultImage = true,
-                            sourceImagePath = backupCandidate.path,
-                            failedStage = "Flash Original Backup Image (dd)",
-                            targetPartitionPath = targetPartitionPath,
-                            partitionLabel = "$bootName$slotSuffix",
-                            selectedDtbId = targetId,
-                            totalDtbCount = dtbNum,
-                            repackedImageBytes = backupCandidate.sizeBytes,
-                            errorMessage = err
-                        )
-                    )
-                }
-                logs.add("[$ts] Step 2/4: Flashed original backup ${backupCandidate.path} to $targetPartitionPath via dd.")
-
-                // Step 3: Verify flash by comparing SHA-256 of backup image against partition readback
-                val imageSha256 = computePathSha256(backupCandidate.path, useRoot = true)
-                val partitionReadbackSha256 = readPartitionPrefixSha256(targetPartitionPath, backupCandidate.sizeBytes)
-                val readbackMatched = if (imageSha256.isNotBlank() && partitionReadbackSha256.isNotBlank()) {
-                    imageSha256.equals(partitionReadbackSha256, ignoreCase = true)
-                } else {
-                    val (cmpExit, _) = execShell(
-                        "cmp -n ${backupCandidate.sizeBytes} '${backupCandidate.path}' '$targetPartitionPath'",
-                        useRoot = true
-                    )
-                    cmpExit == 0
-                }
-
-                if (!readbackMatched) {
-                    val err = "Post-restore verification mismatch on $targetPartitionPath " +
-                        "(expected=${imageSha256.take(12)}, readback=${partitionReadbackSha256.take(12)})."
-                    logs.add("[$ts] $err")
-                    return@withContext ShellExecutionResult(
-                        success = false,
-                        hasRootAccess = true,
-                        activePartition = resolvedPartLabel,
-                        bootName = bootName,
-                        dtsContent = fallbackStockText,
-                        stockDtsContent = fallbackStockText,
-                        detectedDtbs = cachedDtbs,
-                        selectedDtbId = targetId,
-                        logs = logs,
-                        flashVerification = FlashVerificationReport(
-                            success = false,
-                            isRestoreDefaultImage = true,
-                            sourceImagePath = backupCandidate.path,
-                            failedStage = "Post-Restore Partition Readback Verification",
-                            targetPartitionPath = targetPartitionPath,
-                            partitionLabel = "$bootName$slotSuffix",
-                            selectedDtbId = targetId,
-                            totalDtbCount = dtbNum,
-                            repackedImageBytes = backupCandidate.sizeBytes,
-                            imageSha256 = imageSha256,
-                            partitionReadbackSha256 = partitionReadbackSha256,
-                            dtbHeaderVerified = true,
-                            partitionReadbackVerified = false,
-                            errorMessage = err
-                        )
-                    )
-                }
-
-                // Step 4: Sync workspace boot.img and restore stock .dts files from the backed-up image
-                val appUid = Process.myUid()
-                val workspaceBootImg = File(filesDir, "boot.img")
-                if (backupCandidate.path != workspaceBootImg.absolutePath) {
-                    execShell(
-                        "cp -f '${backupCandidate.path}' '${workspaceBootImg.absolutePath}' && " +
-                            "chown $appUid:$appUid '${workspaceBootImg.absolutePath}' && " +
-                            "chmod 666 '${workspaceBootImg.absolutePath}'",
-                        useRoot = true
-                    )
-                }
-                unpackBootImgAndDecompileDtbs(dtcPath, magiskbootPath, logs)
-                val refreshedDtbs = checkDeviceDtbs(logs)
-                if (refreshedDtbs.isNotEmpty()) {
-                    cachedDtbs = refreshedDtbs
-                }
-                ensureWorkspaceFilesWritable()
-
-                val restoredDtsFile = File(filesDir, "$targetId.dts")
-                val restoredStockFile = File(filesDir, "$targetId.dts.stock")
-                if (restoredStockFile.exists() && restoredStockFile.length() > 0L) {
-                    val stockContent = restoredStockFile.readText()
-                    writeFileSafely(restoredDtsFile, stockContent, useRootFallback = true, logs = logs)
-                }
-                val finalRestoredDts = when {
-                    restoredStockFile.exists() && restoredStockFile.length() > 0L -> restoredStockFile.readText()
-                    restoredDtsFile.exists() && restoredDtsFile.length() > 0L -> restoredDtsFile.readText()
-                    else -> fallbackStockText
-                }
-
-                logs.add(
-                    "[$ts] Step 4/4: VERIFIED restore of ${backupCandidate.path} to $targetPartitionPath! " +
-                        "SHA-256 match (${imageSha256.take(16)}...). Ready to reboot."
-                )
-
-                val report = FlashVerificationReport(
-                    success = true,
-                    isRestoreDefaultImage = true,
-                    sourceImagePath = backupCandidate.path,
-                    targetPartitionPath = targetPartitionPath,
-                    partitionLabel = "$bootName$slotSuffix",
-                    selectedDtbId = targetId,
-                    totalDtbCount = dtbNum,
-                    repackedImageBytes = backupCandidate.sizeBytes,
-                    imageSha256 = imageSha256,
-                    partitionReadbackSha256 = partitionReadbackSha256.ifBlank { imageSha256 },
-                    dtbHeaderVerified = true,
-                    partitionReadbackVerified = true
-                )
-
-                ShellExecutionResult(
-                    success = true,
-                    hasRootAccess = true,
-                    activePartition = resolvedPartLabel,
-                    bootName = bootName,
-                    dtsContent = finalRestoredDts,
-                    stockDtsContent = finalRestoredDts,
+            if (!rootAvailable) {
+                val err = "Root access (su) is required to flash backup \"${backup.displayName}\" (${backup.path}) to ${backup.bootName}$slotSuffix."
+                logs.add("[$ts] $err")
+                return@withContext ShellExecutionResult(
+                    success = false,
+                    hasRootAccess = false,
+                    activePartition = partLabel,
+                    bootName = backup.bootName,
+                    dtsContent = fallbackStockText,
+                    stockDtsContent = fallbackStockText,
                     detectedDtbs = cachedDtbs,
                     selectedDtbId = targetId,
                     logs = logs,
-                    flashVerification = report
+                    flashVerification = FlashVerificationReport(
+                        success = false,
+                        isRestoreDefaultImage = true,
+                        sourceImagePath = backup.path,
+                        failedStage = "Root Access Check (su)",
+                        partitionLabel = "${backup.bootName}$slotSuffix",
+                        selectedDtbId = targetId,
+                        totalDtbCount = dtbNum,
+                        errorMessage = err
+                    )
                 )
-            } catch (t: Throwable) {
-                val err = "Restore exception: ${t.message ?: t.javaClass.simpleName}"
+            }
+
+            if (backup.sizeBytes <= 0L) {
+                val err = "Selected backup image \"${backup.displayName}\" (${backup.path}) is empty or missing."
                 logs.add("[$ts] $err")
-                ShellExecutionResult(
+                return@withContext ShellExecutionResult(
                     success = false,
                     hasRootAccess = true,
-                    activePartition = "$bootName (DTB #$targetId)",
+                    activePartition = partLabel,
+                    bootName = backup.bootName,
+                    dtsContent = fallbackStockText,
+                    stockDtsContent = fallbackStockText,
+                    detectedDtbs = cachedDtbs,
+                    selectedDtbId = targetId,
+                    logs = logs,
+                    flashVerification = FlashVerificationReport(
+                        success = false,
+                        isRestoreDefaultImage = true,
+                        sourceImagePath = backup.path,
+                        failedStage = "Locate Selected Backup Image",
+                        partitionLabel = "${backup.bootName}$slotSuffix",
+                        selectedDtbId = targetId,
+                        totalDtbCount = dtbNum,
+                        errorMessage = err
+                    )
+                )
+            }
+
+            bootName = backup.bootName
+            val resolvedPartLabel = "$bootName$slotSuffix (DTB #$targetId)"
+            logs.add(
+                "[$ts] Step 1/4: Selected backup \"${backup.displayName}\" (${backup.path}, ${backup.sizeBytes / 1024} KB)."
+            )
+
+            val targetPartitionPath = resolveBlockDevicePath(bootName, slotSuffix)
+            if (targetPartitionPath == null) {
+                val err = "Could not locate block device for $bootName$slotSuffix."
+                logs.add("[$ts] $err")
+                return@withContext ShellExecutionResult(
+                    success = false,
+                    hasRootAccess = true,
+                    activePartition = resolvedPartLabel,
                     bootName = bootName,
                     dtsContent = fallbackStockText,
                     stockDtsContent = fallbackStockText,
@@ -1335,14 +1677,217 @@ class KonaBessShellEngine(private val context: Context) {
                     flashVerification = FlashVerificationReport(
                         success = false,
                         isRestoreDefaultImage = true,
-                        failedStage = "Restore Exception",
-                        partitionLabel = bootName,
+                        sourceImagePath = backup.path,
+                        failedStage = "Resolve Partition Block Device",
+                        partitionLabel = "$bootName$slotSuffix",
                         selectedDtbId = targetId,
                         totalDtbCount = dtbNum,
+                        repackedImageBytes = backup.sizeBytes,
                         errorMessage = err
                     )
                 )
             }
+
+            // Step 2: Flash the selected backup boot image directly via dd
+            val ddCmd = "blockdev --setrw '$targetPartitionPath' 2>/dev/null || true; " +
+                "dd if='$sourcePath' of='$targetPartitionPath' && sync"
+            val (ddExit, ddOut) = execShell(ddCmd, useRoot = true)
+            if (ddExit != 0) {
+                val err = "dd restore from ${backup.path} to $targetPartitionPath failed (exit=$ddExit): $ddOut"
+                logs.add("[$ts] $err")
+                return@withContext ShellExecutionResult(
+                    success = false,
+                    hasRootAccess = true,
+                    activePartition = resolvedPartLabel,
+                    bootName = bootName,
+                    dtsContent = fallbackStockText,
+                    stockDtsContent = fallbackStockText,
+                    detectedDtbs = cachedDtbs,
+                    selectedDtbId = targetId,
+                    logs = logs,
+                    flashVerification = FlashVerificationReport(
+                        success = false,
+                        isRestoreDefaultImage = true,
+                        sourceImagePath = backup.path,
+                        failedStage = "Flash Selected Backup Image (dd)",
+                        targetPartitionPath = targetPartitionPath,
+                        partitionLabel = "$bootName$slotSuffix",
+                        selectedDtbId = targetId,
+                        totalDtbCount = dtbNum,
+                        repackedImageBytes = backup.sizeBytes,
+                        errorMessage = err
+                    )
+                )
+            }
+            logs.add("[$ts] Step 2/4: Flashed backup \"${backup.displayName}\" to $targetPartitionPath via dd.")
+
+            // Step 3: Verify flash by comparing SHA-256 of backup image against partition readback
+            val imageSha256 = computePathSha256(sourcePath, useRoot = true)
+            val partitionReadbackSha256 = readPartitionPrefixSha256(targetPartitionPath, backup.sizeBytes)
+            val readbackMatched = if (imageSha256.isNotBlank() && partitionReadbackSha256.isNotBlank()) {
+                imageSha256.equals(partitionReadbackSha256, ignoreCase = true)
+            } else {
+                val (cmpExit, _) = execShell(
+                    "cmp -n ${backup.sizeBytes} '$sourcePath' '$targetPartitionPath'",
+                    useRoot = true
+                )
+                cmpExit == 0
+            }
+
+            if (!readbackMatched) {
+                val err = "Post-restore verification mismatch on $targetPartitionPath " +
+                    "(expected=${imageSha256.take(12)}, readback=${partitionReadbackSha256.take(12)})."
+                logs.add("[$ts] $err")
+                return@withContext ShellExecutionResult(
+                    success = false,
+                    hasRootAccess = true,
+                    activePartition = resolvedPartLabel,
+                    bootName = bootName,
+                    dtsContent = fallbackStockText,
+                    stockDtsContent = fallbackStockText,
+                    detectedDtbs = cachedDtbs,
+                    selectedDtbId = targetId,
+                    logs = logs,
+                    flashVerification = FlashVerificationReport(
+                        success = false,
+                        isRestoreDefaultImage = true,
+                        sourceImagePath = backup.path,
+                        failedStage = "Post-Restore Partition Readback Verification",
+                        targetPartitionPath = targetPartitionPath,
+                        partitionLabel = "$bootName$slotSuffix",
+                        selectedDtbId = targetId,
+                        totalDtbCount = dtbNum,
+                        repackedImageBytes = backup.sizeBytes,
+                        imageSha256 = imageSha256,
+                        partitionReadbackSha256 = partitionReadbackSha256,
+                        dtbHeaderVerified = true,
+                        partitionReadbackVerified = false,
+                        errorMessage = err
+                    )
+                )
+            }
+
+            // Step 4: Sync workspace boot.img and unpack .dts files from the flashed backup image
+            val appUid = Process.myUid()
+            val workspaceBootImg = File(filesDir, "boot.img")
+            if (sourcePath != workspaceBootImg.absolutePath) {
+                execShell(
+                    "cp -f '$sourcePath' '${workspaceBootImg.absolutePath}' && " +
+                        "chown $appUid:$appUid '${workspaceBootImg.absolutePath}' && " +
+                        "chmod 666 '${workspaceBootImg.absolutePath}'",
+                    useRoot = true
+                )
+            }
+            unpackBootImgAndDecompileDtbs(dtcPath, magiskbootPath, logs)
+            val refreshedDtbs = checkDeviceDtbs(logs)
+            if (refreshedDtbs.isNotEmpty()) {
+                cachedDtbs = refreshedDtbs
+            }
+            ensureWorkspaceFilesWritable()
+
+            val restoredDtsFile = File(filesDir, "$targetId.dts")
+            val restoredStockFile = File(filesDir, "$targetId.dts.stock")
+            val finalRestoredDts = when {
+                restoredDtsFile.exists() && restoredDtsFile.length() > 0L -> restoredDtsFile.readText()
+                restoredStockFile.exists() && restoredStockFile.length() > 0L -> restoredStockFile.readText()
+                else -> fallbackStockText
+            }
+
+            logs.add(
+                "[$ts] Step 4/4: VERIFIED restore of \"${backup.displayName}\" (${backup.path}) to $targetPartitionPath! " +
+                    "SHA-256 match (${imageSha256.take(16)}...). Ready to reboot."
+            )
+
+            val report = FlashVerificationReport(
+                success = true,
+                isRestoreDefaultImage = true,
+                sourceImagePath = "${backup.displayName} (${backup.path})",
+                targetPartitionPath = targetPartitionPath,
+                partitionLabel = "$bootName$slotSuffix",
+                selectedDtbId = targetId,
+                totalDtbCount = dtbNum,
+                repackedImageBytes = backup.sizeBytes,
+                imageSha256 = imageSha256,
+                partitionReadbackSha256 = partitionReadbackSha256.ifBlank { imageSha256 },
+                dtbHeaderVerified = true,
+                partitionReadbackVerified = true
+            )
+
+            ShellExecutionResult(
+                success = true,
+                hasRootAccess = true,
+                activePartition = resolvedPartLabel,
+                bootName = bootName,
+                dtsContent = finalRestoredDts,
+                stockDtsContent = if (fallbackStockText.isNotBlank()) fallbackStockText else finalRestoredDts,
+                detectedDtbs = cachedDtbs,
+                selectedDtbId = targetId,
+                logs = logs,
+                flashVerification = report
+            )
+        } catch (t: Throwable) {
+            val err = "Restore exception: ${t.message ?: t.javaClass.simpleName}"
+            logs.add("[$ts] $err")
+            ShellExecutionResult(
+                success = false,
+                hasRootAccess = true,
+                activePartition = "$bootName (DTB #$targetId)",
+                bootName = bootName,
+                dtsContent = fallbackStockText,
+                stockDtsContent = fallbackStockText,
+                detectedDtbs = cachedDtbs,
+                selectedDtbId = targetId,
+                logs = logs,
+                flashVerification = FlashVerificationReport(
+                    success = false,
+                    isRestoreDefaultImage = true,
+                    sourceImagePath = backup.path,
+                    failedStage = "Restore Exception",
+                    partitionLabel = bootName,
+                    selectedDtbId = targetId,
+                    totalDtbCount = dtbNum,
+                    errorMessage = err
+                )
+            )
+        }
+    }
+
+    /**
+     * Flashes the default original backed-up boot image directly to the partition.
+     */
+    suspend fun restoreOriginalBootImageAndFlash(preferredDtbId: Int): ShellExecutionResult =
+        withContext(Dispatchers.IO) {
+            recoverWorkspaceMetadataFromDiskIfNeeded()
+            val rootAvailable = checkRootAccess()
+            val candidate = resolveOriginalBackupImage(rootAvailable)
+            val backupItem = if (candidate != null) {
+                SavedBootBackup(
+                    id = "default_stock_${candidate.bootName}.img",
+                    displayName = "Original Unpacked Stock (${candidate.bootName})",
+                    fileName = "${candidate.bootName}.img",
+                    path = candidate.path,
+                    localMirrorPath = candidate.path,
+                    bootName = candidate.bootName,
+                    sizeBytes = candidate.sizeBytes,
+                    lastModifiedMs = System.currentTimeMillis(),
+                    backupModeLabel = "STOCK",
+                    isBuiltInDefault = true
+                )
+            } else {
+                SavedBootBackup(
+                    id = "default_stock_$bootName.img",
+                    displayName = "Original Unpacked Stock ($bootName)",
+                    fileName = "$bootName.img",
+                    path = "/sdcard/$bootName.img",
+                    localMirrorPath = File(filesDir, "backup_$bootName.img").absolutePath,
+                    bootName = bootName,
+                    sizeBytes = 0L,
+                    lastModifiedMs = System.currentTimeMillis(),
+                    backupModeLabel = "STOCK",
+                    isBuiltInDefault = true
+                )
+            }
+            restoreSelectedBackupAndFlash(backupItem, preferredDtbId)
         }
 
     /**

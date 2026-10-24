@@ -1,6 +1,7 @@
 package com.example.konabess.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -25,6 +26,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -59,6 +61,11 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.TurboCoral
 import com.example.ui.theme.UndervoltEmerald
+import com.example.ui.theme.UndervoltEmeraldDim
+import com.example.ui.theme.NominalAmberDim
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -763,13 +770,244 @@ fun ConfirmFlashDialog(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun CreateNamedBackupDialog(
+    activePartition: String,
+    modifiedStepsSummary: List<String>,
+    onDismiss: () -> Unit,
+    onConfirmCreateBackup: (backupName: String, saveModifiedTable: Boolean) -> Unit
+) {
+    val hasModifiedSteps = modifiedStepsSummary.isNotEmpty()
+    var saveModifiedTable by remember { mutableStateOf(hasModifiedSteps) }
+    var backupNameText by remember {
+        mutableStateOf(if (hasModifiedSteps) "Modified_UV" else "Stock")
+    }
+
+    val quickNamePresets = listOf(
+        "Stock" to false,
+        "Undervolt_1Step" to true,
+        "Undervolt_2Steps" to true,
+        "Modified_Custom" to true,
+        "Daily_Stable" to true
+    )
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = SlateSurface,
+            border = BorderStroke(1.dp, NominalAmber.copy(alpha = 0.7f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("create_named_backup_dialog")
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(18.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Create Named Boot Backup",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = NominalAmber,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    text = "Name your backup and choose whether to save the untouched Stock boot image or repack & save your current Modified GPU table:",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary
+                )
+
+                // Backup Mode Selector: Stock vs Modified
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = !saveModifiedTable,
+                        onClick = {
+                            saveModifiedTable = false
+                            if (backupNameText == "Modified_UV") {
+                                backupNameText = "Stock"
+                            }
+                        },
+                        label = {
+                            Text(
+                                text = "Stock Image",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = NominalAmberDim,
+                            selectedLabelColor = NominalAmber,
+                            containerColor = SlateElevated,
+                            labelColor = TextSecondary
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("backup_mode_stock_chip")
+                    )
+
+                    FilterChip(
+                        selected = saveModifiedTable,
+                        onClick = {
+                            saveModifiedTable = true
+                            if (backupNameText == "Stock") {
+                                backupNameText = "Modified_UV"
+                            }
+                        },
+                        label = {
+                            Text(
+                                text = "Modified GPU Table",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = UndervoltEmeraldDim,
+                            selectedLabelColor = UndervoltEmerald,
+                            containerColor = SlateElevated,
+                            labelColor = TextSecondary
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("backup_mode_modified_chip")
+                    )
+                }
+
+                OutlinedTextField(
+                    value = backupNameText,
+                    onValueChange = { backupNameText = it },
+                    label = { Text("Backup Name") },
+                    placeholder = { Text("e.g. Stock, Undervolt_1Step, Modified") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("backup_name_input")
+                )
+
+                Text(
+                    text = "Quick Name Presets:",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    quickNamePresets.forEach { (presetName, presetIsModified) ->
+                        FilterChip(
+                            selected = backupNameText.equals(presetName, ignoreCase = true),
+                            onClick = {
+                                backupNameText = presetName
+                                saveModifiedTable = presetIsModified
+                            },
+                            label = {
+                                Text(
+                                    text = presetName,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = TelemetryCyanDim,
+                                selectedLabelColor = TelemetryCyan,
+                                containerColor = SlateElevated,
+                                labelColor = TextPrimary
+                            ),
+                            modifier = Modifier.testTag("backup_preset_chip_$presetName")
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = SlateElevated,
+                    border = BorderStroke(1.dp, BorderHairline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    val safePreview = backupNameText.trim()
+                        .ifBlank { if (saveModifiedTable) "Modified" else "Stock" }
+                        .replace(Regex("\\s+"), "_")
+                        .replace(Regex("[^A-Za-z0-9_.-]"), "")
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = if (saveModifiedTable) {
+                                "Mode: Repack & Backup Current Modified GPU Table (${modifiedStepsSummary.size} modified step(s))"
+                            } else {
+                                "Mode: Backup Untouched Stock Partition Image ($activePartition)"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (saveModifiedTable) UndervoltEmerald else NominalAmber,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Destination: /sdcard/KonaBessBackups/${safePreview}__vendor_boot.img",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TelemetryCyan
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("cancel_create_backup_button")
+                    ) {
+                        Text("Cancel", color = TextSecondary)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            val finalName = backupNameText.trim().ifBlank {
+                                if (saveModifiedTable) "Modified" else "Stock"
+                            }
+                            onConfirmCreateBackup(finalName, saveModifiedTable)
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NominalAmber,
+                            contentColor = Color(0xFF261700)
+                        ),
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("confirm_create_backup_button")
+                    ) {
+                        Text("Save Named Backup", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ConfirmRestoreDefaultsDialog(
     activePartition: String,
     backupImageSourceSummary: String,
+    availableBackups: List<com.example.konabess.core.KonaBessShellEngine.SavedBootBackup> = emptyList(),
+    selectedBackupId: String? = null,
+    onSelectBackup: (String) -> Unit = {},
+    onDeleteBackup: (com.example.konabess.core.KonaBessShellEngine.SavedBootBackup) -> Unit = {},
+    onLoadBackupIntoEditor: (com.example.konabess.core.KonaBessShellEngine.SavedBootBackup?) -> Unit = {},
     onDismiss: () -> Unit,
     onConfirmRestoreDefaults: () -> Unit
 ) {
+    val selectedBackup = availableBackups.firstOrNull { it.id == selectedBackupId }
+        ?: availableBackups.firstOrNull()
+    val dateFormatter = remember { SimpleDateFormat("MMM d, HH:mm", Locale.US) }
+
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(16.dp),
@@ -786,17 +1024,135 @@ fun ConfirmRestoreDefaultsDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Restore to Defaults (Flash Backup)",
+                    text = "Load / Restore Backed-Up Image",
                     style = MaterialTheme.typography.titleLarge,
                     color = NominalAmber,
                     fontWeight = FontWeight.Bold
                 )
 
                 Text(
-                    text = "This will flash your original backed-up boot image directly back to your partition and reset the GPU frequency & voltage table to stock defaults:",
+                    text = "Choose any saved Stock or Modified backup image below to either Load into the Editor or Flash & Restore directly to your partition:",
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextSecondary
                 )
+
+                if (availableBackups.isEmpty()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = SlateElevated,
+                        border = BorderStroke(1.dp, BorderHairline),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                text = "Default Backup Source: $backupImageSourceSummary",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = NominalAmber,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Tip: Tap Backup on the main screen to create named backups for Stock and Modified configurations.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                    }
+                } else {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("backup_list_column")
+                    ) {
+                        availableBackups.forEach { backup ->
+                            val isSelected = selectedBackup?.id == backup.id
+                            val isStockMode = backup.backupModeLabel.equals("STOCK", ignoreCase = true)
+                            val cardBorder = when {
+                                isSelected && isStockMode -> NominalAmber
+                                isSelected -> UndervoltEmerald
+                                else -> BorderHairline
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSelected) SlateElevated else Color(0xFF0E141F),
+                                border = BorderStroke(if (isSelected) 1.5.dp else 1.dp, cardBorder),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSelectBackup(backup.id) }
+                                    .testTag("backup_item_${backup.id}")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = backup.displayName,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                color = TextPrimary,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Surface(
+                                                color = if (isStockMode) NominalAmberDim else UndervoltEmeraldDim,
+                                                shape = RoundedCornerShape(4.dp),
+                                                border = BorderStroke(
+                                                    1.dp,
+                                                    if (isStockMode) NominalAmber.copy(alpha = 0.6f) else UndervoltEmerald.copy(alpha = 0.6f)
+                                                )
+                                            ) {
+                                                Text(
+                                                    text = backup.backupModeLabel,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = if (isStockMode) NominalAmber else UndervoltEmerald,
+                                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            text = "${backup.bootName} • ${(backup.sizeBytes / 1024).coerceAtLeast(1)} KB • ${dateFormatter.format(Date(backup.lastModifiedMs))}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = TelemetryCyan
+                                        )
+                                        Text(
+                                            text = backup.path,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = TextSecondary
+                                        )
+                                    }
+
+                                    if (!backup.isBuiltInDefault) {
+                                        IconButton(
+                                            onClick = { onDeleteBackup(backup) },
+                                            modifier = Modifier
+                                                .size(48.dp)
+                                                .testTag("delete_backup_${backup.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Delete,
+                                                contentDescription = "Delete backup ${backup.displayName}",
+                                                tint = TurboCoral,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 Surface(
                     shape = RoundedCornerShape(10.dp),
@@ -815,14 +1171,31 @@ fun ConfirmRestoreDefaultsDialog(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Backup Image Source: $backupImageSourceSummary",
+                            text = "Selected Backup: ${selectedBackup?.let { "${it.displayName} (${it.path})" } ?: backupImageSourceSummary}",
                             style = MaterialTheme.typography.bodySmall,
                             color = NominalAmber
                         )
+                    }
+                }
+
+                if (selectedBackup != null) {
+                    OutlinedButton(
+                        onClick = { onLoadBackupIntoEditor(selectedBackup) },
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, TelemetryCyan.copy(alpha = 0.65f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = SlateElevated,
+                            contentColor = TelemetryCyan
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("load_selected_backup_editor_button")
+                    ) {
                         Text(
-                            text = "Pipeline: Locate original backup .img → dd flash to partition → SHA-256 readback verify → Restore stock GPU table",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TelemetryCyan
+                            text = "Load \"${selectedBackup.displayName}\" into Editor Only",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
@@ -851,7 +1224,14 @@ fun ConfirmRestoreDefaultsDialog(
                             .height(48.dp)
                             .testTag("confirm_restore_defaults_now_button")
                     ) {
-                        Text("Restore & Flash Backup", fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (selectedBackup != null) {
+                                "Flash & Restore \"${selectedBackup.displayName}\""
+                            } else {
+                                "Restore & Flash Backup"
+                            },
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }

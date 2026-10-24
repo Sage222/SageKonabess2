@@ -168,5 +168,47 @@ class ExampleRobolectricTest {
             backupFile.delete()
         }
     }
+
+    @Test
+    fun `shellEngine creates named Stock and Modified backups, lists them, and loads selected backup`() =
+        kotlinx.coroutines.runBlocking {
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val backupsDir = java.io.File(context.filesDir, "backups")
+            backupsDir.deleteRecursively()
+            try {
+                val engine = com.example.konabess.core.KonaBessShellEngine(context)
+
+                val (okStock, _) = engine.createNamedBackupImage(
+                    backupName = "Stock_Original",
+                    saveModifiedTable = false,
+                    currentDtsContent = authenticDeviceDts,
+                    preferredDtbId = 0
+                )
+                org.junit.Assert.assertTrue(okStock)
+
+                val modifiedDts = authenticDeviceDts.replace("qcom,level = <0xe0>;", "qcom,level = <0xc0>;")
+                val (okMod, _) = engine.createNamedBackupImage(
+                    backupName = "Undervolt_1Step",
+                    saveModifiedTable = true,
+                    currentDtsContent = modifiedDts,
+                    preferredDtbId = 0
+                )
+                org.junit.Assert.assertTrue(okMod)
+
+                val listed = engine.listAvailableBackups()
+                val names = listed.map { it.displayName }
+                org.junit.Assert.assertTrue(names.contains("Stock_Original"))
+                org.junit.Assert.assertTrue(names.contains("Undervolt_1Step"))
+
+                val selectedMod = listed.first { it.displayName == "Undervolt_1Step" }
+                assertEquals("MODIFIED", selectedMod.backupModeLabel)
+
+                val loaded = engine.loadBackupIntoWorkspace(selectedMod, preferredDtbId = 0)
+                org.junit.Assert.assertTrue(loaded.success)
+                org.junit.Assert.assertTrue(loaded.dtsContent.contains("qcom,level = <0xc0>;"))
+            } finally {
+                backupsDir.deleteRecursively()
+            }
+        }
 }
 
